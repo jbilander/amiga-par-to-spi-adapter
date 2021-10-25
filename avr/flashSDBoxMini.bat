@@ -1,0 +1,1 @@
+"C:\Program Files (x86)\Arduino\hardware\tools\avr/bin/avrdude" -C"C:\Program Files (x86)\Arduino\hardware\tools\avr/etc/avrdude.conf" -v -pm328p -cstk500v1 -PCOM4 -b19200 -Uflash:w:main.hex:i -Ulfuse:w:0xe6:m -Uhfuse:w:0xdf:m -Uefuse:w:0xfc:m
