@@ -1,0 +1,1 @@
+"C:\Program Files (x86)\Arduino\hardware\tools\avr/bin/avrdude" -C"C:\Program Files (x86)\Arduino\hardware\tools\avr/etc/avrdude.conf" -v -pm328p -carduino -PCOM4 -b115200 -Uflash:w:ArduinoISP.ino.arduino_standard.hex:i
