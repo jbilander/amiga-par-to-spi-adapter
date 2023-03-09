@@ -17,8 +17,11 @@
 #include <libraries/dos.h>
 #include <devices/timer.h>
 #include <devices/trackdisk.h>
+#include <devices/newstyle.h>
 #include <proto/exec.h>
+#include <proto/alib.h>
 
+#include "version.h"
 #include "sd.h"
 #include "spi.h"
 
@@ -35,24 +38,9 @@
 #define SIGF_OP_REQUEST (1 << SIGB_OP_REQUEST)
 #define SIGF_OP_TIMER (1 << SIGB_TIMER)
 
-#ifndef TD_GETGEOMETRY
-// Needed to compile with AmigaOS 1.3 headers.
-#define TD_GETGEOMETRY	(CMD_NONSTD+13)
-
-struct DriveGeometry
-{
-    ULONG	dg_SectorSize;
-    ULONG	dg_TotalSectors;
-    ULONG	dg_Cylinders;
-    ULONG	dg_CylSectors;
-    ULONG	dg_Heads;
-    ULONG	dg_TrackSectors;
-    ULONG	dg_BufMemType;
-    UBYTE	dg_DeviceType;
-    UBYTE	dg_Flags;
-    UWORD	dg_Reserved;
-};
-#endif
+// How much of struct NSDeviceQueryResult we use/need. It could be extended
+// and we don't want that to change the behaviour of the code.
+#define NSD_QUERY_RESULT_LENGTH_REQUIRED 16
 
 struct ExecBase *SysBase;
 static BPTR saved_seg_list;
@@ -67,9 +55,6 @@ static volatile ULONG card_change_num;
 static struct Interrupt *remove_int;
 static struct IOStdReq *change_int;
 
-char device_name[] = "spisd.device";
-char id_string[] = "spisd 2.0 (19 July 2021)";
-
 static uint32_t device_get_geometry(struct IOStdReq *ior)
 {
     struct DriveGeometry *geom = (struct DriveGeometry*)ior->io_Data;
@@ -79,14 +64,14 @@ static uint32_t device_get_geometry(struct IOStdReq *ior)
         return TDERR_DiskChanged;
 
     geom->dg_SectorSize = 1 << ci->block_size;
-    geom->dg_TotalSectors = ci->total_sectors; //ci->capacity >> ci->block_size;
-    geom->dg_Cylinders = geom->dg_TotalSectors;
-    geom->dg_CylSectors = 1;
-    geom->dg_Heads = 1;
-    geom->dg_TrackSectors = 1;
+    geom->dg_TotalSectors = ci->total_sectors;
+    geom->dg_Cylinders = geom->dg_TotalSectors / 4096;
+    geom->dg_CylSectors = 4096;
+    geom->dg_Heads = 16;
+    geom->dg_TrackSectors = geom->dg_Cylinders / 16;
     geom->dg_BufMemType = MEMF_PUBLIC;
-    geom->dg_DeviceType = 0; //DG_DIRECT_ACCESS;
-    geom->dg_Flags = 1; //DGF_REMOVABLE;
+    geom->dg_DeviceType = DG_DIRECT_ACCESS;
+    geom->dg_Flags = DGF_REMOVABLE;
     return 0;
 }
 
@@ -117,6 +102,11 @@ static void handle_changed()
         Cause((struct Interrupt *)change_int->io_Data);
 }
 
+static uint32_t offset_to_sd_sectors(uint32_t high_offset, uint32_t low_offset)
+{
+    return (high_offset << (32 - SD_SECTOR_SHIFT)) | (low_offset >> SD_SECTOR_SHIFT);
+}
+
 static void process_request(struct IOStdReq *ior)
 {
     if (!card_present)
@@ -133,14 +123,22 @@ static void process_request(struct IOStdReq *ior)
 
         case TD_FORMAT:
         case CMD_WRITE:
-            if (sd_write((uint8_t *)ior->io_Data, ior->io_Offset >> SD_SECTOR_SHIFT, ior->io_Length >> SD_SECTOR_SHIFT) == 0)
+            ior->io_Actual = 0;
+        case TD_FORMAT64:
+        case TD_WRITE64:
+        case NSCMD_TD_FORMAT64:
+        case NSCMD_TD_WRITE64:
+            if (sd_write((uint8_t *)ior->io_Data, offset_to_sd_sectors(ior->io_Actual, ior->io_Offset), ior->io_Length >> SD_SECTOR_SHIFT) == 0)
                 ior->io_Actual = ior->io_Length;
             else
                 ior->io_Error = TDERR_NotSpecified;
             break;
 
         case CMD_READ:
-            if (sd_read((uint8_t *)ior->io_Data, ior->io_Offset >> SD_SECTOR_SHIFT, ior->io_Length >> SD_SECTOR_SHIFT) == 0)
+            ior->io_Actual = 0;
+        case TD_READ64:
+        case NSCMD_TD_READ64:
+            if (sd_read((uint8_t *)ior->io_Data, offset_to_sd_sectors(ior->io_Actual, ior->io_Offset), ior->io_Length >> SD_SECTOR_SHIFT) == 0)
                 ior->io_Actual = ior->io_Length;
             else
                 ior->io_Error = TDERR_NotSpecified;
@@ -185,13 +183,39 @@ static void change_isr()
     Signal(task, SIGF_CARD_CHANGE);
 }
 
+static const UWORD supported_commands[] =
+{
+    CMD_RESET,
+    CMD_READ,
+    CMD_WRITE,
+    CMD_UPDATE,
+    CMD_CLEAR,
+    TD_MOTOR,
+    TD_FORMAT,
+    TD_REMOVE,
+    TD_CHANGENUM,
+    TD_CHANGESTATE,
+    TD_PROTSTATUS,
+    TD_GETDRIVETYPE,
+    TD_ADDCHANGEINT,
+    TD_REMCHANGEINT,
+    TD_GETGEOMETRY,
+    TD_READ64,
+    TD_WRITE64,
+    TD_FORMAT64,
+    NSCMD_DEVICEQUERY,
+    NSCMD_TD_READ64,
+    NSCMD_TD_WRITE64,
+    NSCMD_TD_FORMAT64,
+    0
+};
+
 static void begin_io(__reg("a6") struct Library *dev, __reg("a1") struct IOStdReq *ior)
 {
     if (!ior)
         return;
 
     ior->io_Error = 0;
-    ior->io_Actual = 0;
 
     switch (ior->io_Command)
     {
@@ -200,6 +224,7 @@ static void begin_io(__reg("a6") struct Library *dev, __reg("a1") struct IOStdRe
     case CMD_UPDATE:
     case TD_MOTOR:
     case TD_PROTSTATUS:
+        ior->io_Actual = 0;
         break;
 
     case TD_CHANGESTATE:
@@ -211,7 +236,7 @@ static void begin_io(__reg("a6") struct Library *dev, __reg("a1") struct IOStdRe
         break;
 
     case TD_GETDRIVETYPE:
-        ior->io_Actual = 0; //DG_DIRECT_ACCESS;
+        ior->io_Actual = DG_DIRECT_ACCESS;
         break;
 
     case TD_REMOVE:
@@ -234,10 +259,31 @@ static void begin_io(__reg("a6") struct Library *dev, __reg("a1") struct IOStdRe
             change_int = NULL;
         break;
 
+    case NSCMD_DEVICEQUERY:
+        if (ior->io_Length >= NSD_QUERY_RESULT_LENGTH_REQUIRED)
+        {
+            struct NSDeviceQueryResult *result = ior->io_Data;
+            result->nsdqr_DevQueryFormat = 0;
+            result->nsdqr_SizeAvailable = NSD_QUERY_RESULT_LENGTH_REQUIRED;
+            result->nsdqr_DeviceType = NSDEVTYPE_TRACKDISK;
+            result->nsdqr_DeviceSubType = 0;
+            result->nsdqr_SupportedCommands = supported_commands;
+            ior->io_Actual = NSD_QUERY_RESULT_LENGTH_REQUIRED;
+        }
+        else {
+            ior->io_Error = IOERR_BADLENGTH;
+        }
+        break;
+
     case TD_GETGEOMETRY:
     case TD_FORMAT:
     case CMD_WRITE:
     case CMD_READ:
+    case TD_READ64:
+    case TD_WRITE64:
+    case NSCMD_TD_READ64:
+    case NSCMD_TD_WRITE64:
+    case NSCMD_TD_FORMAT64:
         PutMsg(&mp, (struct Message *)&ior->io_Message);
         ior->io_Flags &= ~IOF_QUICK;
         ior = NULL;
@@ -264,8 +310,8 @@ static struct Library *init_device(__reg("a6") struct ExecBase *sys_base, __reg(
     dev->lib_Node.ln_Type = NT_DEVICE;
     dev->lib_Node.ln_Name = device_name;
     dev->lib_Flags = LIBF_SUMUSED | LIBF_CHANGED;
-    dev->lib_Version = 2;
-    dev->lib_Revision = 0;
+    dev->lib_Version = VERSION;
+    dev->lib_Revision = REVISION;
     dev->lib_IdString = (APTR)id_string;
 
     Forbid();
