@@ -21,18 +21,33 @@ xt_highint5:
     s32i    a14, a0, LX_INTR_A14_OFFSET
     s32i    a13, a0, LX_INTR_A13_OFFSET
 
-    
-    /* Clear interrupt GPIO39, note name "STATUS1" for GPIO32-39 and "STATUS" for GPIO0-31, esp32_technical_reference_manual_en.pdf */
-    movi    a14, GPIO_STATUS1_W1TC_REG
-    movi    a15, (1 << 7)
-    s32i    a15, a14, 0
+    /* Check and clear interrupt GPIO32 and/or GPIO34, set corresponding ISR volatile int (ISR0, ISR1)  */
+
+    movi	a13, GPIO_STATUS1_REG
     memw
-    
-    /* Raise ISR0 flag */
-    movi    a13, ISR0
-    movi    a14, 1
-    s32i    a14, a13, 0
+    l32i.n	a13, a13, 0
+    bbci	a13, 0, check_next_gpio34
+    movi.n	a14, (1 << 0)
+    movi	a15, GPIO_STATUS1_W1TC_REG
     memw
+    s32i.n	a14, a15, 0
+    movi	a15, ISR0
+    memw
+    s32i	a14, a15, 0
+
+check_next_gpio34:
+
+    bbci	a13, 2, all_done
+    movi	a13, GPIO_STATUS1_W1TC_REG
+    movi.n	a14, (1 << 2)
+    memw
+    s32i.n	a14, a13, 0
+    movi	a13, ISR1
+    movi.n	a14, 1
+    memw
+    s32i	a14, a13, 0
+
+all_done:
 
     l32i    a15, a0, LX_INTR_A15_OFFSET
     l32i    a14, a0, LX_INTR_A14_OFFSET
