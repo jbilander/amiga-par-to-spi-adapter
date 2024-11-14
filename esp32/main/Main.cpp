@@ -54,6 +54,21 @@ void set_data_direction_to_output()
     REG_WRITE(GPIO_FUNC18_OUT_SEL_CFG_REG, 0x100);
 }
 
+void set_data_direction_to_input()
+{
+    REG_WRITE(GPIO_ENABLE_W1TC_REG, BIT(D0_BIT) | BIT(D1_BIT) | BIT(D2_BIT) | BIT(D3_BIT) |
+                                    BIT(D4_BIT) | BIT(D5_BIT) | BIT(D6_BIT) | BIT(D7_BIT));
+
+    PIN_INPUT_ENABLE(IO_MUX_GPIO27_REG);
+    PIN_INPUT_ENABLE(IO_MUX_GPIO26_REG);
+    PIN_INPUT_ENABLE(IO_MUX_GPIO25_REG);
+    PIN_INPUT_ENABLE(IO_MUX_GPIO23_REG);
+    PIN_INPUT_ENABLE(IO_MUX_GPIO22_REG);
+    PIN_INPUT_ENABLE(IO_MUX_GPIO21_REG);
+    PIN_INPUT_ENABLE(IO_MUX_GPIO19_REG);
+    PIN_INPUT_ENABLE(IO_MUX_GPIO18_REG);
+}
+
 void setup()
 {
     gpio_config_t io_conf;
@@ -155,6 +170,7 @@ void setup()
     io_conf.pin_bit_mask = (1ULL << D7_BIT);
     ESP_ERROR_CHECK(gpio_config(&io_conf));
 
+    gpio_set_level(ACT_BIT_n, 1);
     gpio_set_level(IRQ_BIT_n, 1);
     card_present_n = gpio_get_level(CP_BIT_n);
 
@@ -182,6 +198,7 @@ void loop()
             if (REG_GET_BIT(GPIO_IN1_REG, (1 << 0))) // REQ_BIT_n
             {
                 gpio_set_level(ACT_BIT_n, 1);
+                set_data_direction_to_input();
             }
             else
             {
