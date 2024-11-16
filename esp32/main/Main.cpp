@@ -4,6 +4,9 @@
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <driver/gpio.h>
+#include <esp_vfs_fat.h>
+#include <driver/spi_common.h>
+#include <sdmmc_cmd.h>
 #include <rom/ets_sys.h>
 #include <soc/gpio_reg.h>
 #include <soc/soc.h>
@@ -15,6 +18,14 @@ static const char *INFO_TAG = "LOG_INFO";
 volatile int ISR0;
 volatile int ISR1;
 int card_present_n; // holds cp state, 0 = card present, 1 = card ejected
+
+spi_bus_config_t spi_bus_cfg;
+sdspi_device_config_t sdspi_device_config;
+sdspi_dev_handle_t sdspi_dev_handle;
+
+esp_vfs_fat_sdmmc_mount_config_t sdmmc_mount_config;
+sdmmc_card_t *sdmmc_card;
+sdmmc_host_t sdmmc_host;
 
 esp_timer_handle_t debounce_timer;
 
@@ -170,10 +181,47 @@ void setup()
     io_conf.pin_bit_mask = (1ULL << D7_BIT);
     ESP_ERROR_CHECK(gpio_config(&io_conf));
 
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pin_bit_mask = (1ULL << MOSI_BIT);
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+
     gpio_set_level(ACT_BIT_n, 1);
     gpio_set_level(IRQ_BIT_n, 1);
     card_present_n = gpio_get_level(CP_BIT_n);
 
+    // SPI
+    spi_bus_cfg = {
+        .mosi_io_num = MOSI_BIT,
+        .miso_io_num = MISO_BIT,
+        .sclk_io_num = SCK_BIT,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = SPI_MAX_DMA_LEN};
+
+    sdmmc_mount_config = {.format_if_mount_failed = false};
+    sdmmc_host = SDSPI_HOST_DEFAULT();
+
+    sdspi_device_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    sdspi_device_config.gpio_cs = SS_BIT_n;
+    sdspi_device_config.host_id = HSPI_HOST;
+
+    ESP_ERROR_CHECK(spi_bus_initialize(HSPI_HOST, &spi_bus_cfg, SDSPI_DEFAULT_DMA));  // Initialize the SPI bus
+    ESP_ERROR_CHECK(sdspi_host_init_device(&sdspi_device_config, &sdspi_dev_handle)); // Attach the SD card to the SPI bus
+
+    if (!card_present_n)
+    {
+        esp_vfs_fat_sdspi_mount(MOUNT_POINT, &sdmmc_host, &sdspi_device_config, &sdmmc_mount_config, &sdmmc_card);
+        sdmmc_card_print_info(stdout, sdmmc_card);
+    }
+    else
+    {
+        ESP_LOGI(INFO_TAG, "CARD NOT PRESENT!!!");
+    }
+
+    // Set up level 5 interrupt
     int INTR_NUM = 31; // extern level 5, see table in file soc.h for details
     ESP_INTR_DISABLE(INTR_NUM);
     intr_matrix_set(xPortGetCoreID(), ETS_GPIO_INTR_SOURCE, INTR_NUM);
@@ -193,17 +241,17 @@ void loop()
     {
         if (ISR0) // handler for REQ signal changes
         {
-            ISR0 = 0;
-
             if (REG_GET_BIT(GPIO_IN1_REG, (1 << 0))) // REQ_BIT_n
             {
-                gpio_set_level(ACT_BIT_n, 1);
+                REG_WRITE(GPIO_ENABLE1_W1TS_REG, 1 << 1); //de-assert ACT_BIT_n
                 set_data_direction_to_input();
             }
             else
             {
                 start_command();
             }
+
+            ISR0 = 0;
         }
         if (ISR1) // handler for CP signal changes
         {

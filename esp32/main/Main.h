@@ -11,6 +11,13 @@
 #define D6_BIT GPIO_NUM_19
 #define D7_BIT GPIO_NUM_18
 
+// SPI
+#define SCK_BIT GPIO_NUM_14  // Output.
+#define MISO_BIT GPIO_NUM_12 // Input.
+#define MOSI_BIT GPIO_NUM_13 // Output.
+#define SS_BIT_n GPIO_NUM_4  // Output, active low.
+#define MOUNT_POINT "/sdcard"
+
 // Control lines and interrupts
 #define IRQ_BIT_n GPIO_NUM_5  // Output, active low, open collector, external pull-up.
 #define LED_BIT GPIO_NUM_2    // Output
