@@ -231,8 +231,38 @@ void setup()
     ESP_ERROR_CHECK(esp_timer_create(&debounce_timer_args, &debounce_timer));
 }
 
+void loop();
+
 void start_command()
 {
+    uint8_t dval;
+    uint8_t cval;
+    uint8_t next_port_d;
+    uint8_t next_port_c;
+    uint16_t byte_count;
+
+    uint32_t in_reg = REG_READ(GPIO_IN_REG);
+
+    dval = (bool)(in_reg & (1 << D7_BIT)) << 7 | (bool)(in_reg & (1 << D6_BIT)) << 6 | (bool)(in_reg & (1 << D5_BIT)) << 5 | (bool)(in_reg & (1 << D4_BIT)) << 4 |
+           (bool)(in_reg & (1 << D3_BIT)) << 3 | (bool)(in_reg & (1 << D2_BIT)) << 2 | (bool)(in_reg & (1 << D1_BIT)) << 1 | (bool)(in_reg & (1 << D0_BIT));
+
+    cval = dval & 0x3F;
+
+    if (!(dval & 0x80)) // READ1 or WRITE1
+    {
+        byte_count = cval;
+
+        REG_WRITE(GPIO_OUT1_W1TC_REG, (1 << 1)); // assert ACT_BIT_n
+
+        if (dval & 0x40)
+            goto do_read;
+        else
+            goto do_write;
+    }
+    do_read:
+    loop();
+    do_write:
+    loop();
 }
 
 void loop()
@@ -243,7 +273,7 @@ void loop()
         {
             if (REG_GET_BIT(GPIO_IN1_REG, (1 << 0))) // REQ_BIT_n
             {
-                REG_WRITE(GPIO_ENABLE1_W1TS_REG, 1 << 1); //de-assert ACT_BIT_n
+                REG_WRITE(GPIO_OUT1_W1TS_REG, (1 << 1)); // de-assert ACT_BIT_n
                 set_data_direction_to_input();
             }
             else
