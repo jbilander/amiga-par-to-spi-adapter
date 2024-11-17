@@ -29,6 +29,8 @@ sdmmc_host_t sdmmc_host;
 
 esp_timer_handle_t debounce_timer;
 
+void loop();
+
 static void debounce_timer_callback(void *arg)
 {
     if (card_present_n != gpio_get_level(CP_BIT_n))
@@ -231,7 +233,20 @@ void setup()
     ESP_ERROR_CHECK(esp_timer_create(&debounce_timer_args, &debounce_timer));
 }
 
-void loop();
+uint8_t getDvalFromReg()
+{
+    uint32_t in_reg = REG_READ(GPIO_IN_REG);
+    uint32_t in1_reg = REG_READ(GPIO_IN1_REG);
+    return (bool)(in_reg & (1 << D7_BIT)) << 7 | (bool)(in_reg & (1 << D6_BIT)) << 6 | (bool)(in1_reg & (1 << 3)) << 5; // CLK_BIT is bit 3 in second reg
+}
+
+uint8_t getCvalFromReg()
+{
+    uint32_t in_reg = REG_READ(GPIO_IN_REG);
+    return (bool)(in_reg & (1 << D6_BIT)) << 6 | (bool)(in_reg & (1 << D5_BIT)) << 5 | (bool)(in_reg & (1 << D4_BIT)) << 4 |
+           (bool)(in_reg & (1 << D3_BIT)) << 3 | (bool)(in_reg & (1 << D2_BIT)) << 2 | (bool)(in_reg & (1 << D1_BIT)) << 1 |
+           (bool)(in_reg & (1 << D0_BIT));
+}
 
 void start_command()
 {
@@ -241,12 +256,8 @@ void start_command()
     uint8_t next_port_c;
     uint16_t byte_count;
 
-    uint32_t in_reg = REG_READ(GPIO_IN_REG);
-
-    dval = (bool)(in_reg & (1 << D7_BIT)) << 7 | (bool)(in_reg & (1 << D6_BIT)) << 6 | (bool)(in_reg & (1 << D5_BIT)) << 5 | (bool)(in_reg & (1 << D4_BIT)) << 4 |
-           (bool)(in_reg & (1 << D3_BIT)) << 3 | (bool)(in_reg & (1 << D2_BIT)) << 2 | (bool)(in_reg & (1 << D1_BIT)) << 1 | (bool)(in_reg & (1 << D0_BIT));
-
-    cval = dval & 0x3F;
+    dval = getDvalFromReg();
+    cval = getCvalFromReg();
 
     if (!(dval & 0x80)) // READ1 or WRITE1
     {
@@ -259,9 +270,36 @@ void start_command()
         else
             goto do_write;
     }
-    do_read:
+    else if (!(dval & 0x40)) // READ2 or WRITE2
+    {
+        byte_count = cval << 7;
+
+        REG_WRITE(GPIO_OUT1_W1TC_REG, (1 << 1)); // assert ACT_BIT_n
+
+        if (dval & (1 << 5)) // CLK_BIT is bit 5 in dval
+        {
+            while (getDvalFromReg() & (1 << 5))
+                ;
+        }
+        else
+        {
+            while (!(getDvalFromReg() & (1 << 5)))
+                ;
+        }
+
+        dval = getDvalFromReg();
+        cval = getCvalFromReg();
+
+        byte_count |= cval;
+
+        if (dval & 0x80)
+            goto do_read;
+        else
+            goto do_write;
+    }
+do_read:
     loop();
-    do_write:
+do_write:
     loop();
 }
 
