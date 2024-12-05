@@ -20,12 +20,15 @@ volatile int ISR1;
 int card_present_n; // holds cp state, 0 = card present, 1 = card ejected
 
 spi_bus_config_t spi_bus_cfg;
+spi_device_handle_t spi_device_handle;
+spi_device_interface_config_t devcfg;
+
 sdspi_device_config_t sdspi_device_config;
 sdspi_dev_handle_t sdspi_dev_handle;
 
-esp_vfs_fat_sdmmc_mount_config_t sdmmc_mount_config;
-sdmmc_card_t *sdmmc_card;
-sdmmc_host_t sdmmc_host;
+// esp_vfs_fat_sdmmc_mount_config_t sdmmc_mount_config;
+// sdmmc_card_t *sdmmc_card;
+// sdmmc_host_t sdmmc_host;
 
 esp_timer_handle_t debounce_timer;
 
@@ -55,7 +58,7 @@ void set_data_direction_to_output()
     PIN_INPUT_DISABLE(IO_MUX_GPIO18_REG);
 
     REG_WRITE(GPIO_ENABLE_W1TS_REG, BIT(D0_BIT) | BIT(D1_BIT) | BIT(D2_BIT) | BIT(D3_BIT) |
-                                    BIT(D4_BIT) | BIT(D5_BIT) | BIT(D6_BIT) | BIT(D7_BIT));
+                                        BIT(D4_BIT) | BIT(D5_BIT) | BIT(D6_BIT) | BIT(D7_BIT));
 
     REG_WRITE(GPIO_FUNC27_OUT_SEL_CFG_REG, 0x100);
     REG_WRITE(GPIO_FUNC26_OUT_SEL_CFG_REG, 0x100);
@@ -70,7 +73,7 @@ void set_data_direction_to_output()
 void set_data_direction_to_input()
 {
     REG_WRITE(GPIO_ENABLE_W1TC_REG, BIT(D0_BIT) | BIT(D1_BIT) | BIT(D2_BIT) | BIT(D3_BIT) |
-                                    BIT(D4_BIT) | BIT(D5_BIT) | BIT(D6_BIT) | BIT(D7_BIT));
+                                        BIT(D4_BIT) | BIT(D5_BIT) | BIT(D6_BIT) | BIT(D7_BIT));
 
     PIN_INPUT_ENABLE(IO_MUX_GPIO27_REG);
     PIN_INPUT_ENABLE(IO_MUX_GPIO26_REG);
@@ -203,20 +206,28 @@ void setup()
         .quadhd_io_num = -1,
         .max_transfer_sz = SPI_MAX_DMA_LEN};
 
-    sdmmc_mount_config = {.format_if_mount_failed = false};
-    sdmmc_host = SDSPI_HOST_DEFAULT();
+    // sdmmc_mount_config = {.format_if_mount_failed = false};
+    // sdmmc_host = SDSPI_HOST_DEFAULT();
 
     sdspi_device_config = SDSPI_DEVICE_CONFIG_DEFAULT();
     sdspi_device_config.gpio_cs = SS_BIT_n;
     sdspi_device_config.host_id = HSPI_HOST;
 
-    ESP_ERROR_CHECK(spi_bus_initialize(HSPI_HOST, &spi_bus_cfg, SDSPI_DEFAULT_DMA));  // Initialize the SPI bus
-    ESP_ERROR_CHECK(sdspi_host_init_device(&sdspi_device_config, &sdspi_dev_handle)); // Attach the SD card to the SPI bus
+    devcfg = {
+        .mode = 0,                         // SPI mode 0: CPOL:-0 and CPHA:-0
+        .clock_speed_hz = 500 * 1000,      // Clock out at 500 kHz
+        .spics_io_num = SS_BIT_n,          // This field is used to specify the GPIO pin that is to be used as CS'
+        .queue_size = 7,                   // We want to be able to queue 7 transactions at a time
+    };
+
+    ESP_ERROR_CHECK(spi_bus_initialize(HSPI_HOST, &spi_bus_cfg, SDSPI_DEFAULT_DMA)); // Initialize the SPI bus
+    ESP_ERROR_CHECK(spi_bus_add_device(HSPI_HOST, &devcfg, &spi_device_handle));
+    // ESP_ERROR_CHECK(sdspi_host_init_device(&sdspi_device_config, &sdspi_dev_handle)); // Attach the SD card to the SPI bus
 
     if (!card_present_n)
     {
-        esp_vfs_fat_sdspi_mount(MOUNT_POINT, &sdmmc_host, &sdspi_device_config, &sdmmc_mount_config, &sdmmc_card);
-        sdmmc_card_print_info(stdout, sdmmc_card);
+        // esp_vfs_fat_sdspi_mount(MOUNT_POINT, &sdmmc_host, &sdspi_device_config, &sdmmc_mount_config, &sdmmc_card);
+        // sdmmc_card_print_info(stdout, sdmmc_card);
     }
     else
     {
@@ -233,140 +244,109 @@ void setup()
     ESP_ERROR_CHECK(esp_timer_create(&debounce_timer_args, &debounce_timer));
 }
 
-uint8_t getDvalFromReg()
+uint8_t getCmdValFromReg()
 {
-    uint32_t in_reg = REG_READ(GPIO_IN_REG);
-    uint32_t in1_reg = REG_READ(GPIO_IN1_REG);
-    return (bool)(in_reg & (1 << D7_BIT)) << 7 | (bool)(in_reg & (1 << D6_BIT)) << 6 | (bool)(in1_reg & (1 << 3)) << 5; // CLK_BIT is bit 3 in second reg
+    return (uint8_t)REG_READ(GPIO_IN1_REG);
 }
 
-uint8_t getCvalFromReg()
+uint8_t getDataFromReg()
 {
     uint32_t in_reg = REG_READ(GPIO_IN_REG);
-    return (bool)(in_reg & (1 << D6_BIT)) << 6 | (bool)(in_reg & (1 << D5_BIT)) << 5 | (bool)(in_reg & (1 << D4_BIT)) << 4 |
-           (bool)(in_reg & (1 << D3_BIT)) << 3 | (bool)(in_reg & (1 << D2_BIT)) << 2 | (bool)(in_reg & (1 << D1_BIT)) << 1 |
-           (bool)(in_reg & (1 << D0_BIT));
+    return (bool)(in_reg & (1 << D7_BIT)) << 7 | (bool)(in_reg & (1 << D6_BIT)) << 6 | (bool)(in_reg & (1 << D5_BIT)) << 5 | (bool)(in_reg & (1 << D4_BIT)) << 4 |
+           (bool)(in_reg & (1 << D3_BIT)) << 3 | (bool)(in_reg & (1 << D2_BIT)) << 2 | (bool)(in_reg & (1 << D1_BIT)) << 1 | (bool)(in_reg & (1 << D0_BIT));
 }
 
 void start_command()
 {
-    uint8_t dval;
-    uint8_t cval;
-    uint8_t next_port_d;
-    uint8_t next_port_c;
+    uint8_t data = getDataFromReg();
+    uint8_t cmd_val = getCmdValFromReg();
     uint16_t byte_count;
 
-    dval = getDvalFromReg();
-    cval = getCvalFromReg();
-
-    if (!(dval & 0x80)) // READ1 or WRITE1
+    if (!(data & 0x80)) // READ1 or WRITE1
     {
-        printf("INSIDE READ1 or WRITE1\n");
-        byte_count = cval;
+        ets_printf("INSIDE READ1 or WRITE1\n");
+        REG_WRITE(GPIO_OUT1_W1TC_REG, (1UL << 1)); // assert ACT_BIT_n
+        byte_count = data & 0x3f;
 
-        REG_WRITE(GPIO_OUT1_W1TC_REG, (1 << 1)); // assert ACT_BIT_n
+        char buffer[33];
+        itoa(byte_count, buffer, 2);
+        printf("BYTE_COUNT: %s\n", buffer);
 
-        if (dval & 0x40)
+        if (data & 0x40)
             goto do_read;
         else
             goto do_write;
     }
-    else if (!(dval & 0x40)) // READ2 or WRITE2
+    else if (!(data & 0x40)) // READ2 or WRITE2
     {
         printf("INSIDE READ2 or WRITE2\n");
-        byte_count = cval << 7;
-
-        REG_WRITE(GPIO_OUT1_W1TC_REG, (1 << 1)); // assert ACT_BIT_n
-
-        if (dval & (1 << 5)) // CLK_BIT is bit 5 in dval
-        {
-            while (getDvalFromReg() & (1 << 5))
-                ;
-        }
-        else
-        {
-            while (!(getDvalFromReg() & (1 << 5)))
-                ;
-        }
-
-        dval = getDvalFromReg();
-        cval = getCvalFromReg();
-
-        byte_count |= cval;
-
-        if (dval & 0x80)
-            goto do_read;
-        else
-            goto do_write;
     }
     else
     {
-        char buffer[33];
-        itoa(cval, buffer, 2);
-        printf("cval: %s\n", buffer);
-
-        uint8_t cmd = (cval & 0x3e) >> 1;
-        itoa(cmd, buffer, 2);
-        printf("cmd: %s\n", buffer);
+        uint8_t cmd = (data & 0x3e) >> 1;
 
         if (cmd == 0) // SPI_SELECT
         {
-            printf("INSIDE SPI_SELECT\n");
+            REG_WRITE(GPIO_OUT1_W1TC_REG, (1UL << 1)); // assert ACT_BIT_n
 
-            if (cval & 1) // Select
+            if ((data & 0x3f) & 1) // Select
             {
-                // PORTB &= ~((1 << SS_BIT_n) | (1 << LED_BIT_n));
-                REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << LED_BIT));
-                printf("SELECT\n");
+                REG_WRITE(GPIO_OUT_W1TC_REG, (1UL << SS_BIT_n)); // assert SS_BIT_n
+                REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << LED_BIT));  // LED on
             }
             else // Deselect
             {
-                // PORTB |= (1 << SS_BIT_n) | (1 << LED_BIT_n);
-                REG_WRITE(GPIO_OUT_W1TC_REG, (1UL << LED_BIT));
-                printf("DE-SELECT\n");
+                REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << SS_BIT_n)); // de-assert SS_BIT_n
+                REG_WRITE(GPIO_OUT_W1TC_REG, (1UL << LED_BIT));  // LED off
             }
-
-            REG_WRITE(GPIO_OUT1_W1TC_REG, (1 << 1)); // assert ACT_BIT_n
         }
         else if (cmd == 1) // CARD_PRESENT
         {
-            printf("INSIDE CARD_PRESENT\n");
-            card_present_n = 0;
             REG_WRITE(GPIO_OUT_W1TC_REG, (1UL << IRQ_BIT_n)); // assert IRQ_BIT_n
-            REG_WRITE(GPIO_OUT1_W1TC_REG, (1 << 1));          // assert ACT_BIT_n
+            REG_WRITE(GPIO_OUT1_W1TC_REG, (1UL << 1));        // assert ACT_BIT_n
 
-            if (dval & (1 << 5)) // CLK_BIT is bit 5 in dval
+            if (cmd_val & (1 << 3)) // CLK_BIT is bit 3 in cmd_val
             {
-                while (getDvalFromReg() & (1 << 5))
+                while (getCmdValFromReg() & (1 << 3))
                     ;
             }
             else
             {
-                while (!(getDvalFromReg() & (1 << 5)))
+                while (!(getCmdValFromReg() & (1 << 3)))
                     ;
             }
 
             set_data_direction_to_output();
-            REG_WRITE(GPIO_OUT_W1TC_REG, 0xEEC0000); // clear D0-D7 (set them low)
+            REG_WRITE(GPIO_OUT_W1TC_REG, 0xEEC0000ul); // clear D0-D7 (set them low)
 
-            if (!(REG_GET_BIT(GPIO_IN1_REG, (1 << 2)))) // CP_BIT_n
-            {
-                REG_WRITE(GPIO_OUT_W1TS_REG, (1 << D0_BIT)); // Set D0 high
-                printf("Set D0 high\n");
-            }
+            if (!(getCmdValFromReg() & (1 << 2)))              // CP_BIT_n is bit 2 in cmd_val
+                REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << D0_BIT)); // Set D0 high
 
-            REG_WRITE(GPIO_OUT1_W1TS_REG, (1 << 1)); // de-assert ACT_BIT_n
-
-            printf("INSIDE CARD_PRESENT END\n");
+            REG_WRITE(GPIO_OUT1_W1TS_REG, (1UL << 1)); // de-assert ACT_BIT_n
         }
+        else if (cmd == 2) // SPEED
+        {
+            if ((data & 0x3f) & 1)                       // Fast
+                devcfg.clock_speed_hz = 8 * 1000 * 1000; // Clock out at 8 MHz
+            else                                         // Slow
+                devcfg.clock_speed_hz = 500 * 1000;      // Clock out at 500 kHz
+
+            REG_WRITE(GPIO_OUT1_W1TC_REG, (1UL << 1)); // assert ACT_BIT_n
+        }
+
         loop();
     }
 do_read:
-    printf("INSIDE do_read\n");
-    loop();
+    ets_printf("DO_READ\n");
+
+    while (true)
+        ;
+
 do_write:
-    printf("INSIDE do_write\n");
-    loop();
+    ets_printf("DO_WRITE\n");
+
+    while (true)
+        ;
 }
 
 void loop()
@@ -375,16 +355,13 @@ void loop()
     {
         if (ISR0) // handler for REQ signal changes
         {
-            printf("ISR0 triggered\n");
             if (REG_GET_BIT(GPIO_IN1_REG, (1 << 0))) // REQ_BIT_n
             {
-                printf("REQ_BIT_n: 1\n");
                 REG_WRITE(GPIO_OUT1_W1TS_REG, (1 << 1)); // de-assert ACT_BIT_n
                 set_data_direction_to_input();
             }
             else
             {
-                printf("start_command() triggered\n");
                 start_command();
             }
 
@@ -402,6 +379,5 @@ void loop()
 extern "C" void app_main()
 {
     setup();
-    // start_command();
     loop();
 }
