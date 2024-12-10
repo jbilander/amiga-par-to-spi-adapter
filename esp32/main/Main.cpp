@@ -33,6 +33,7 @@ sdspi_dev_handle_t sdspi_dev_handle;
 esp_timer_handle_t debounce_timer;
 
 void loop();
+void spi_read_data(uint8_t addr);
 
 static void debounce_timer_callback(void *arg)
 {
@@ -214,10 +215,10 @@ void setup()
     sdspi_device_config.host_id = HSPI_HOST;
 
     devcfg = {
-        .mode = 0,                         // SPI mode 0: CPOL:-0 and CPHA:-0
-        .clock_speed_hz = 500 * 1000,      // Clock out at 500 kHz
-        .spics_io_num = SS_BIT_n,          // This field is used to specify the GPIO pin that is to be used as CS'
-        .queue_size = 7,                   // We want to be able to queue 7 transactions at a time
+        .mode = 0,                    // SPI mode 0: CPOL:-0 and CPHA:-0
+        .clock_speed_hz = 250 * 1000, // Clock out at 250 kHz
+        .spics_io_num = SS_BIT_n,     // This field is used to specify the GPIO pin that is to be used as CS'
+        .queue_size = 7,              // We want to be able to queue 7 transactions at a time
     };
 
     ESP_ERROR_CHECK(spi_bus_initialize(HSPI_HOST, &spi_bus_cfg, SDSPI_DEFAULT_DMA)); // Initialize the SPI bus
@@ -329,7 +330,7 @@ void start_command()
             if ((data & 0x3f) & 1)                       // Fast
                 devcfg.clock_speed_hz = 8 * 1000 * 1000; // Clock out at 8 MHz
             else                                         // Slow
-                devcfg.clock_speed_hz = 500 * 1000;      // Clock out at 500 kHz
+                devcfg.clock_speed_hz = 250 * 1000;      // Clock out at 250 kHz
 
             REG_WRITE(GPIO_OUT1_W1TC_REG, (1UL << 1)); // assert ACT_BIT_n
         }
@@ -339,6 +340,8 @@ void start_command()
 do_read:
     ets_printf("DO_READ\n");
 
+    spi_read_data(0xFF);
+
     while (true)
         ;
 
@@ -347,6 +350,17 @@ do_write:
 
     while (true)
         ;
+}
+
+void spi_read_data(uint8_t addr) // Function to read data at given address
+{
+    uint8_t instruction_to_read_data[1] = {addr};
+    spi_transaction_t trans_desc = {
+        .flags = SPI_TRANS_USE_RXDATA,
+        .length = 8,
+        .rxlength = 8,
+        .tx_buffer = instruction_to_read_data};
+    ESP_ERROR_CHECK(spi_device_polling_transmit(spi_device_handle, &trans_desc));
 }
 
 void loop()
