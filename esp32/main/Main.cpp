@@ -21,7 +21,10 @@ int card_present_n; // holds cp state, 0 = card present, 1 = card ejected
 
 spi_bus_config_t spi_bus_cfg;
 spi_device_handle_t spi_device_handle;
-spi_device_interface_config_t devcfg;
+spi_device_handle_t spi_device_slow_handle;
+spi_device_handle_t spi_device_fast_handle;
+spi_device_interface_config_t devcfg_slow;
+spi_device_interface_config_t devcfg_fast;
 
 sdspi_device_config_t sdspi_device_config;
 sdspi_dev_handle_t sdspi_dev_handle;
@@ -214,15 +217,23 @@ void setup()
     sdspi_device_config.gpio_cs = SS_BIT_n;
     sdspi_device_config.host_id = HSPI_HOST;
 
-    devcfg = {
+    devcfg_slow = {
         .mode = 0,                    // SPI mode 0: CPOL:-0 and CPHA:-0
         .clock_speed_hz = 250 * 1000, // Clock out at 250 kHz
         .spics_io_num = SS_BIT_n,     // This field is used to specify the GPIO pin that is to be used as CS'
         .queue_size = 7,              // We want to be able to queue 7 transactions at a time
     };
 
+    devcfg_fast = {
+        .mode = 0,                         // SPI mode 0: CPOL:-0 and CPHA:-0
+        .clock_speed_hz = 8 * 1000 * 1000, // Clock out at 8 MHz
+        .spics_io_num = SS_BIT_n,          // This field is used to specify the GPIO pin that is to be used as CS'
+        .queue_size = 7,                   // We want to be able to queue 7 transactions at a time
+    };
+
     ESP_ERROR_CHECK(spi_bus_initialize(HSPI_HOST, &spi_bus_cfg, SDSPI_DEFAULT_DMA)); // Initialize the SPI bus
-    ESP_ERROR_CHECK(spi_bus_add_device(HSPI_HOST, &devcfg, &spi_device_handle));
+    ESP_ERROR_CHECK(spi_bus_add_device(HSPI_HOST, &devcfg_slow, &spi_device_slow_handle));
+    ESP_ERROR_CHECK(spi_bus_add_device(HSPI_HOST, &devcfg_fast, &spi_device_fast_handle));
     // ESP_ERROR_CHECK(sdspi_host_init_device(&sdspi_device_config, &sdspi_dev_handle)); // Attach the SD card to the SPI bus
 
     if (!card_present_n)
@@ -327,10 +338,10 @@ void start_command()
         }
         else if (cmd == 2) // SPEED
         {
-            if ((data & 0x3f) & 1)                       // Fast
-                devcfg.clock_speed_hz = 8 * 1000 * 1000; // Clock out at 8 MHz
-            else                                         // Slow
-                devcfg.clock_speed_hz = 250 * 1000;      // Clock out at 250 kHz
+            if ((data & 0x3f) & 1) // Fast
+                spi_device_handle = spi_device_fast_handle;
+            else // Slow
+                spi_device_handle = spi_device_slow_handle;
 
             REG_WRITE(GPIO_OUT1_W1TC_REG, (1UL << 1)); // assert ACT_BIT_n
         }
