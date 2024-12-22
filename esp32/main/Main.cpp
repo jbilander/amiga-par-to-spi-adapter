@@ -197,8 +197,16 @@ void setup()
     io_conf.pin_bit_mask = (1ULL << MOSI_BIT);
     ESP_ERROR_CHECK(gpio_config(&io_conf));
 
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pin_bit_mask = (1ULL << SS_BIT_n);
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+
     gpio_set_level(ACT_BIT_n, 1);
     gpio_set_level(IRQ_BIT_n, 1);
+    gpio_set_level(SS_BIT_n, 1);
     card_present_n = gpio_get_level(CP_BIT_n);
 
     // SPI
@@ -213,21 +221,21 @@ void setup()
     // sdmmc_mount_config = {.format_if_mount_failed = false};
     // sdmmc_host = SDSPI_HOST_DEFAULT();
 
-    sdspi_device_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    sdspi_device_config.gpio_cs = SS_BIT_n;
-    sdspi_device_config.host_id = HSPI_HOST;
+    // sdspi_device_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    // sdspi_device_config.gpio_cs = SS_BIT_n;
+    // sdspi_device_config.host_id = HSPI_HOST;
 
     devcfg_slow = {
         .mode = 0,                    // SPI mode 0: CPOL:-0 and CPHA:-0
         .clock_speed_hz = 250 * 1000, // Clock out at 250 kHz
-        .spics_io_num = SS_BIT_n,     // This field is used to specify the GPIO pin that is to be used as CS'
+        .spics_io_num = -1,           // This field is used to specify the GPIO pin that is to be used as CS'
         .queue_size = 7,              // We want to be able to queue 7 transactions at a time
     };
 
     devcfg_fast = {
         .mode = 0,                         // SPI mode 0: CPOL:-0 and CPHA:-0
         .clock_speed_hz = 8 * 1000 * 1000, // Clock out at 8 MHz
-        .spics_io_num = SS_BIT_n,          // This field is used to specify the GPIO pin that is to be used as CS'
+        .spics_io_num = -1,                // This field is used to specify the GPIO pin that is to be used as CS'
         .queue_size = 7,                   // We want to be able to queue 7 transactions at a time
     };
 
@@ -371,7 +379,10 @@ void spi_read_data(uint8_t addr) // Function to read data at given address
         .length = 8,
         .rxlength = 8,
         .tx_buffer = instruction_to_read_data};
+
+    REG_WRITE(GPIO_OUT_W1TC_REG, (1UL << SS_BIT_n)); // assert SS_BIT_n
     ESP_ERROR_CHECK(spi_device_polling_transmit(spi_device_handle, &trans_desc));
+    REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << SS_BIT_n)); // de-assert SS_BIT_n
 }
 
 void loop()
