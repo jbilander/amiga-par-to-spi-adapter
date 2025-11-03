@@ -1,15 +1,22 @@
-# Shared SD Card Synchronization Strategy: RP2350 ↔ Amiga
+# RP2350 Dual-Core SD Card Synchronization with Amiga
 
 ## Overview
-This document describes how to safely share a single SD card between an Amiga computer and an RP2350 microcontroller with two cores — one acting as a block-level interface bridge for the Amiga, and the other running an FTP server that also accesses the SD card. It integrates the current `spisd.device` commands with a hybrid semaphore strategy and uses proper header-based integration for `par_spi.c`.
+This setup shares a single SD card between:
 
-## Architecture Summary
-- **RP2350 Core 0 (FTP Server):** Runs SdFat (or FatFS), handles FTP commands (STOR, RETR), flushes files, sends `CMD_REFRESH` to Amiga.
-- **RP2350 Core 1 (Parallel SPI Bridge):** Implements Amiga parallel port protocol using `par_spi.c` (via `par_spi.h`), provides block-level access, sends `CMD_DIRTY` when Amiga writes/format/remove.
-- **Amiga (fat95 filesystem):** Holds FAT16/FAT32 state in RAM, performs block-level I/O via `spisd.device`. Responds to CMD_REFRESH by flushing/remounting filesystem.
-- **Synchronization:** Hybrid semaphore + atomic flag ensures writes are atomic, reads are non-blocking unless a write is in progress.
+- **Amiga** — running `spisd.device` (fat95 filesystem in RAM)  
+- **RP2350 Core 0** — FTP server (direct SD card access via SdFat/FatFS)  
+- **RP2350 Core 1** — parallel SPI interface (`par_spi.c`) acting as a **block-level bridge**  
 
-## Data Flow Diagram
+Key goals:
+
+- Preserve **current `par_spi.c` behavior** for the Amiga.  
+- Allow **FTP server writes** without corrupting Amiga view.  
+- Ensure Amiga sees **latest filesystem updates** via `CMD_REFRESH`.  
+- Provide **atomic access** via a semaphore.
+
+---
+
+## Architecture Diagram
              +-----------------------------+
              |           Amiga             |
              |     fat95 filesystem        |
@@ -34,176 +41,151 @@ This document describes how to safely share a single SD card between an Amiga co
                           |    SD Card     |
                           +----------------+
 
-## Synchronization Mechanism
-Hybrid Lock Strategy: Writes acquire semaphore, reads wait only if a write is active. Atomic flag `sd_writing` indicates active write.
+---
 
-```c
+## Core 0 — FTP Server with Semaphore
+
+```c++
+#include "SdFat.h"
+#include "pico/sync.h"
 #include <stdatomic.h>
-#include <pico/sync.h>
+#include "par_spi.h"
 
+SdFat sd;
 semaphore_t sd_semaphore;
 atomic_bool sd_writing = false;
 
-void acquire_write() {
-    sem_acquire_blocking(&sd_semaphore);
-    atomic_store(&sd_writing, true);
+void ftp_init() {
+    sem_init(&sd_semaphore, 1, 1); // binary semaphore
+    sd.begin();
 }
 
-void release_write() {
+void ftp_write_file(const char* filename, const uint8_t* data, size_t length) {
+    sem_acquire_blocking(&sd_semaphore);
+    atomic_store(&sd_writing, true);
+
+    File f = sd.open(filename, O_WRONLY | O_CREAT | O_TRUNC);
+    if (f) {
+        f.write(data, length);
+        f.sync();
+        f.close();
+    }
+
+    par_spi_send_command(CMD_REFRESH); // notify Amiga fat95 cache
+
     atomic_store(&sd_writing, false);
     sem_release(&sd_semaphore);
 }
-
-void read_sd_block_safe(...) {
-    while (atomic_load(&sd_writing)) {
-        tight_loop_contents();
-    }
-    do_block_read(...);
-}
 ```
 
-## Core 0 (FTP Server) — SdFat Example
-```c++
-#include "SdFat.h"
-#include "pico/multicore.h"
+> Notes:
+> - All SD card writes (file creation, modification, formatting, removal) **acquire the semaphore**.  
+> - After write, **CMD_REFRESH** is sent to Amiga to update fat95.  
+
+---
+
+## Core 1 — par_spi.c (Minimal Changes)
+
+```c
 #include "par_spi.h"
-
-extern semaphore_t sd_semaphore;
-extern atomic_bool sd_writing;
-
-SdFat sd;
-File ftp_file;
-
-void ftp_handle_stor(const char* filename, const uint8_t* data, size_t length) {
-    acquire_write();
-    if (!sd.begin()) { release_write(); return; }
-
-    ftp_file.open(filename, O_WRONLY | O_CREAT | O_TRUNC);
-    ftp_file.write(data, length);
-    ftp_file.sync();
-    ftp_file.close();
-
-    par_spi_send_command(CMD_REFRESH); // notify Amiga
-    release_write();
-}
-```
-
-(FatFS alternative)
-```c
-/*
-f_mount(&FatFs, "", 1);
-f_open(&fil, filename, FA_CREATE_ALWAYS | FA_WRITE);
-f_write(&fil, data, length, &bw);
-f_sync(&fil);
-f_close(&fil);
-*/
-```
-
-## Core 1 (Parallel SPI Bridge) — par_spi.c Integration with device.c commands
-```c
-#include "par_spi.h"    // par_spi_init(), par_spi_get_command(), par_spi_send_command()
-#include "device.h"     // handle_device_command()
 #include <stdatomic.h>
-#include <pico/sync.h>
 
 extern semaphore_t sd_semaphore;
 extern atomic_bool sd_writing;
 
-void core1_main() {
-    par_spi_init();
+void handle_amiga_command(int cmd, command_params_t* params) {
+    switch(cmd) {
+        // Critical writes: wait if FTP server is writing
+        case TD_WRITE:
+        case TD_WRITE64:
+        case NSCMD_TD_WRITE64:
+        case TD_FORMAT:
+        case TD_FORMAT64:
+        case TD_REMOVE:
+        case CMD_CLEAR:
+        case CMD_UPDATE:
+        case CMD_RESET:
+            while (atomic_load(&sd_writing)) {
+                tight_loop_contents(); // wait for Core 0 write to finish
+            }
+            // proceed with existing block-level write logic
+            do_block_write(params->sector, params->buffer, params->count);
+            break;
 
-    while (true) {
-        int cmd = par_spi_get_command();
+        // Reads: optionally block if FTP write active
+        case CMD_READ:
+        case TD_READ64:
+        case NSCMD_TD_READ64:
+            while (atomic_load(&sd_writing)) {
+                tight_loop_contents();
+            }
+            do_block_read(params->sector, params->buffer, params->count);
+            break;
 
-        switch(cmd) {
-            // Reads (non-blocking unless write active)
-            case CMD_READ:
-            case TD_READ64:
-            case NSCMD_TD_READ64:
-                read_sd_block_safe(...);
-                break;
-
-            // Critical writes / FAT changes / formatting / remove / resets
-            case CMD_WRITE:
-            case TD_WRITE:
-            case TD_WRITE64:
-            case NSCMD_TD_WRITE64:
-            case TD_FORMAT:
-            case TD_FORMAT64:
-            case CMD_CLEAR:
-            case TD_REMOVE:
-            case CMD_UPDATE:
-            case CMD_RESET:
-            case TD_MOTOR:
-            case TD_CHANGENUM:
-            case TD_CHANGESTATE:
-            case TD_PROTSTATUS:
-            case TD_GETDRIVETYPE:
-            case TD_ADDCHANGEINT:
-            case TD_REMCHANGEINT:
-            case TD_GETGEOMETRY:
-            case NSCMD_DEVICEQUERY:
-                acquire_write();
-                handle_device_command(cmd, ...);
-                release_write();
-                if (cmd != CMD_READ && cmd != TD_READ64 && cmd != NSCMD_TD_READ64) {
-                    par_spi_send_command(CMD_DIRTY); // notify FTP core
-                }
-                break;
-
-            default:
-                handle_non_critical_command(cmd);
-                break;
-        }
+        default:
+            // handle other commands unchanged
+            process_non_critical_command(cmd, params);
+            break;
     }
 }
 ```
 
-## Filesystem Synchronization Sequence
-1. **FTP Server → Amiga:** Writes file(s), flushes, sets `sd_writing=false`, sends CMD_REFRESH. Amiga flushes/remounts FAT.
-2. **Amiga → FTP Server:** Writes via fat95 through Core 1. Core 1 sends CMD_DIRTY. FTP core refreshes filesystem (`sd.end(); sd.begin();`).
+> Notes:
+> - **No SdFat calls in Core 1** — it remains a block-level bridge.  
+> - Reads can optionally spin while Core 0 writes.  
+> - Writes/format/remove commands **wait for Core 0 semaphore** if active.  
 
-## Summary Table (Hybrid Lock)
+---
 
-| Operation | Needs Semaphore | Notes |
-|-----------|----------------|-------|
-| FTP read | ❌ unless sd_writing active | Safe if no write ongoing |
-| FTP write | ✅ | Block reads/writes |
-| Amiga read | ❌ unless sd_writing active | Safe if no write ongoing |
-| Amiga write / format / mkdir / delete | ✅ | Acquire semaphore |
-| Filesystem refresh / remount | ✅ | Acquire semaphore |
+## Amiga Side — `spisd.device` CMD_REFRESH
 
-## Minimal par_spi.h
+Inside `process_request()`:
+
 ```c
-#ifndef PAR_SPI_H
-#define PAR_SPI_H
+#define CMD_REFRESH 0xF0
 
-#include <stdint.h>
+void process_request(IORequest* req) {
+    int cmd = req->cmd;
 
-void par_spi_init(void);
-int par_spi_get_command(void);
-void par_spi_send_command(uint8_t cmd);
-void do_block_read(uint32_t sector, uint8_t* buffer);
-void do_block_write_or_format(uint32_t sector, const uint8_t* buffer, uint32_t count);
+    switch(cmd) {
+        // existing commands
+        case CMD_REFRESH:
+            // Invalidate fat95 caches so latest SD card contents are visible
+            if (fat95_invalidate_cache() != 0) {
+                kprintf("spisd.device: CMD_REFRESH failed\n");
+            }
+            fat95_refresh_directories(); // optional
+            break;
 
-#endif
+        default:
+            // other commands unchanged
+            break;
+    }
+}
 ```
 
-## Minimal device.h
-```c
-#ifndef DEVICE_H
-#define DEVICE_H
+> - `process_request()` is called by `begin_io()`.  
+> - No other changes are needed in `spisd.device`.  
 
-#include <stdint.h>
+---
 
-void handle_device_command(int cmd, void* params);
-void handle_non_critical_command(int cmd);
+## Command Flow Summary
 
-#endif
-```
+| Source        | Operation                    | Semaphore | Notes |
+|---------------|-----------------------------|-----------|-------|
+| FTP server    | Write, format, remove       | ✅        | Acquire semaphore |
+| FTP server    | Read                        | ❌        | Optional: block if needed |
+| Amiga         | Write, format, remove       | Wait if FTP active | Uses block-level SPI |
+| Amiga         | Read                        | Wait if FTP active | Uses block-level SPI |
+| Core 0 → Amiga| CMD_REFRESH                 | ❌        | Updates fat95 cache |
 
-## Summary
-- Maximizes read concurrency while maintaining atomic writes.
-- Semaphore + atomic flag prevents read/write races.
-- Integrates cleanly with existing `par_spi.c` and `device.c` commands.
-- Ensures both FTP clients and Amiga see consistent filesystem state.
+---
+
+## Notes
+
+- This approach **keeps `par_spi.c` intact** — only minor spinlocks added to block Amiga writes/reads if Core 0 is writing.  
+- All **FTP server writes** are safe and flushed before notifying Amiga.  
+- **Amiga fat95 filesystem** sees updates via `CMD_REFRESH` without remounting.  
+- No changes to Amiga block command protocol, minimal impact on existing firmware.  
+- Core 0 handles **SdFat/FatFS**, Core 1 remains **block-level SPI bridge**.
+
