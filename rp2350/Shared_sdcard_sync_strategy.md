@@ -2,137 +2,133 @@
 
 ## Overview
 
-This strategy enables **safe bidirectional access** to a single SD card shared between:
+This strategy enables safe bidirectional access to a single SD card shared between:
 
-* **RP2350 MCU (FTP server)** — Core 0: runs **SdFat** (or FatFS) filesystem
+* **RP2350 MCU (FTP server)** — Core 0: runs SdFat or FatFS filesystem
 * **Amiga (via spisd.device)** — Core 1: presents the SD card as a block device using fat95
 
-Both cores share the same SPI bus. The goal is to allow **writes from either side** without corrupting data and without unmounting/remounting unnecessarily.
+Both cores share the same SPI bus. The goal is to allow writes, file creation, and formatting from either side without corrupting data.
 
 ---
 
 ## Key Principles
 
-1. **Single active filesystem per core:**
-   Each core maintains its own filesystem in RAM. All writes must be flushed before notifying the other side.
-
+1. **Single active filesystem per core:** Each core maintains its own filesystem in RAM. All writes must be flushed before notifying the other side.
 2. **Bidirectional “media-dirty” signaling:**
 
-   * RP2350 writes → Amiga refresh (`TD_UPDATE`)
+   * RP2350 writes → Amiga refresh (TD_UPDATE)
    * Amiga writes → RP2350 refresh (SdFat or FatFS remount/reopen)
-
-3. **No new hardware pins required:**
-   Existing parallel interface pins are preserved. Notifications are done via **custom protocol opcodes**.
+3. **Global semaphore for SD/FS access:** All filesystem operations (writes, file creation, FAT updates, formatting) use a semaphore to ensure only one core accesses the SD card at a time.
 
 ---
 
-## Protocol Opcodes
+## Supported Critical Commands
 
-| Direction      | Opcode               | Purpose                                   | Effect                                                                               |
-| -------------- | -------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------ |
-| RP2350 → Amiga | `CMD_REFRESH` (0xF0) | Request Amiga to refresh fat95 filesystem | TD_UPDATE; directories and FAT re-read in place, volume stays mounted                |
-| Amiga → RP2350 | `CMD_DIRTY` (0xF1)   | Notify FTP core that media changed        | RP2350 sets dirty counter/flag; SdFat or FatFS remounts or reopens volume to refresh |
+From `spisd/device.c` around line 186, the following commands **must be treated as critical** and wrapped with the SD/FS semaphore:
+
+| Command          | Description                    | Semaphore Handling                                                        |
+| ---------------- | ------------------------------ | ------------------------------------------------------------------------- |
+| TD_WRITE         | Standard sector write          | acquire semaphore → write → flush → release semaphore → notify other core |
+| TD_WRITE64       | Multi-sector write             | same as TD_WRITE                                                          |
+| NSCMD_TD_WRITE64 | Custom large write             | same as TD_WRITE                                                          |
+| TD_FORMAT        | Format filesystem              | acquire semaphore → format → flush → release → notify                     |
+| TD_FORMAT64      | Large format variant           | same as TD_FORMAT                                                         |
+| CMD_WRITE        | Custom write command           | same as TD_WRITE                                                          |
+| CMD_UPDATE       | Metadata refresh / FAT reload  | acquire semaphore → refresh metadata → release → notify                   |
+| CMD_CLEAR        | Clear sectors / zero blocks    | acquire semaphore → clear → flush → release → notify                      |
+| TD_REMOVE        | File or directory deletion     | acquire semaphore → remove → flush → release → notify                     |
+| CMD_RESET        | Reset interface / driver state | acquire semaphore → reset → release → notify                              |
+
+> Note: Only commands actually present in `device.c` are included. Directory creation/removal commands like `TD_MKDIR` or `TD_RMDIR` do not exist in this driver version.
 
 ---
 
-## RP2350 Firmware Logic (Multi-Client Safe)
-
-Use an **atomic counter** for multi-client safety.
+## RP2350 Firmware Logic (Multi-Client Safe using Semaphore)
 
 ```c
-#include <stdatomic.h>
+#include "pico/sem.h" // RP2040 SDK semaphore
+#include "SdFat.h" // or FatFS
 
-// Count of dirty notifications from Amiga
-atomic_uint media_dirty_from_amiga = 0;
+semaphore_t sd_fs_sem;
 
-// When Amiga sends CMD_DIRTY:
-atomic_fetch_add(&media_dirty_from_amiga, 1);
-
-// Before serving FTP requests (directory listing, file access):
-if (atomic_exchange(&media_dirty_from_amiga, 0) > 0) {
-    // At least one dirty notification occurred → refresh filesystem
-
-    // For FatFS:
-    f_mount(NULL, "", 0);   // unmount
-    f_mount(&FatFs, "", 1); // remount, re-read FAT and directories
-
-    // For SdFat:
-    sd.end();       // close volume and release resources
-    sd.begin();     // re-initialize SD card and reload FAT/directory structures
+void init_sd_fs_sem() {
+    sem_init(&sd_fs_sem, 1, 1); // binary semaphore initialized to 1
 }
-```
 
-After FTP writes:
+void acquire_sd_fs() {
+    sem_acquire_blocking(&sd_fs_sem);
+}
 
-```c
-f_close(&fil);          // flush all writes
-par_spi_send_command(CMD_REFRESH); // notify Amiga
-```
+void release_sd_fs() {
+    sem_release(&sd_fs_sem);
+}
 
----
-
-## Amiga (spisd.device) Logic
-
-* Handle `CMD_REFRESH` by issuing **TD_UPDATE** to fat95:
-
-```c
-case CMD_REFRESH:
-    spisd_refresh_filesystem();
-    break;
-
-void spisd_refresh_filesystem(void)
-{
-    // Issue TD_UPDATE to fat95
-    struct IOExtTD *ioreq = CreateIORequest(...);
-    if (ioreq) {
-        ioreq->iotd_Req.io_Command = TD_UPDATE;
-        DoIO((struct IORequest*)ioreq);
-        DeleteIORequest((struct IORequest*)ioreq);
+void check_dirty_and_refresh() {
+    if (atomic_exchange(&media_dirty_from_amiga, 0) > 0) {
+        acquire_sd_fs();
+        // FatFS example
+        f_mount(NULL, "", 0);
+        f_mount(&FatFs, "", 1);
+        // SdFat example
+        sd.end();
+        sd.begin();
+        release_sd_fs();
     }
 }
 ```
 
-* After any Amiga write (`TD_WRITE`), send `CMD_DIRTY` to RP2350:
+---
+
+### Core 1: Parallel SPI Interface (Amiga) Example with Semaphore
 
 ```c
-case TD_WRITE:
-    result = spisd_do_write(ioreq);
-    if (result == OK)
-        par_spi_send_command(CMD_DIRTY);
-    break;
+void core1_par_spi_main() {
+    par_spi_init();
+
+    while(1) {
+        par_spi_poll();
+
+        switch(cmd) {
+            case TD_WRITE:
+            case TD_WRITE64:
+            case NSCMD_TD_WRITE64:
+            case TD_FORMAT:
+            case TD_FORMAT64:
+            case CMD_WRITE:
+            case CMD_UPDATE:
+            case CMD_CLEAR:
+            case TD_REMOVE:
+            case CMD_RESET:
+                acquire_sd_fs();
+                handle_command(cmd, ...); // perform write, format, remove, clear, reset, or metadata refresh
+                release_sd_fs();
+
+                par_spi_send_command(CMD_DIRTY); // notify FTP core
+                break;
+            default:
+                // non-critical commands, read-only or status
+                break;
+        }
+    }
+}
 ```
 
 ---
 
-## Sequence Example
+### Notes & Recommendations
 
-| Step | Actor                     | Action                              | Result                                                                   |
-| ---- | ------------------------- | ----------------------------------- | ------------------------------------------------------------------------ |
-| 1    | Amiga                     | Writes `FILE1.TXT`                  | TD_WRITE                                                                 |
-| 2    | spisd.device              | Sends `CMD_DIRTY`                   | RP2350 increments atomic dirty counter                                   |
-| 3    | FTP client                | Requests directory listing          | RP2350 sees counter > 0 → remounts/reopens filesystem → sees `FILE1.TXT` |
-| 4    | FTP writes `FILE2.TXT`    | Flush + `CMD_REFRESH`               | Amiga fat95 sees TD_UPDATE → `FILE2.TXT` appears                         |
-| 5    | Both sides remain mounted | Both sides now see latest directory | No unmounts at Amiga, minimal downtime at FTP server                     |
+* Semaphore ensures only one core accesses the SD card at a time, providing safer multi-core operation than a spinlock.
+* Flush all writes before releasing the semaphore (f_sync() or sd.sync()).
+* Use the RP2040 SDK semaphore API (`sem_init`, `sem_acquire_blocking`, `sem_release`).
+* Fat95 version ≥ 3.18 is required for TD_UPDATE.
 
 ---
 
-## Notes & Recommendations
-
-* Always flush filesystem writes before sending notifications (`f_sync()` / `f_close()`).
-* Only one core should write at a time; the atomic counter ensures multi-client FTP safety.
-* For **SdFat**, there is no built-in refresh API — reinitialize the SD card object (`sd.end()` + `sd.begin()`) to reload FAT and directories after external changes.
-* For **FatFS**, remounting (`f_mount(NULL)` + `f_mount()`) clears caches and ensures filesystem coherence.
-* Optional optimization: batch writes and send one notification per batch.
-* Fat95 version ≥ 3.18 is required for `TD_UPDATE`.
-* No hardware changes required; uses existing parallel port protocol.
-
----
-
-## Diagram
+### Diagram
 
 ```
 Amiga --- CMD_DIRTY ---> RP2350 FTP core
 RP2350 FTP core --- CMD_REFRESH ---> Amiga
 ```
 
-This strategy ensures **real-time directory updates**, **safe bidirectional access**, and **multi-client safe handling** for both FatFS and SdFat without unmounting the Amiga volume.
+Result: Safe, atomic, bidirectional SD card access across cores using a semaphore for synchronization.
