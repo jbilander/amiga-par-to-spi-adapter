@@ -7,7 +7,7 @@ This strategy enables safe bidirectional access to a single SD card shared betwe
 * **RP2350 MCU (FTP server)** — Core 0: runs SdFat or FatFS filesystem
 * **Amiga (via spisd.device)** — Core 1: presents the SD card as a block device using fat95
 
-Both cores share the same SPI bus. The goal is to allow writes, file creation, and formatting from either side without corrupting data.
+Both cores share the same SPI bus. The goal is to allow **all commands** currently used in `device.c` to be handled safely, with critical commands protected by a semaphore.
 
 ---
 
@@ -18,56 +18,63 @@ Both cores share the same SPI bus. The goal is to allow writes, file creation, a
 
    * RP2350 writes → Amiga refresh (TD_UPDATE)
    * Amiga writes → RP2350 refresh (SdFat or FatFS remount/reopen)
-3. **Global semaphore for SD/FS access:** All filesystem operations (writes, file creation, FAT updates, formatting) use a semaphore to ensure only one core accesses the SD card at a time.
+3. **Global semaphore for SD/FS access:** All filesystem-modifying operations use a semaphore to ensure only one core accesses the SD card at a time.
 
 ---
 
-## Supported Critical Commands
+## Command Classification and Handling
 
-| Command          | Description                    | Semaphore Handling                                                        |
-| ---------------- | ------------------------------ | ------------------------------------------------------------------------- |
-| TD_WRITE         | Standard sector write          | acquire semaphore → write → flush → release semaphore → notify other core |
-| TD_WRITE64       | Multi-sector write             | same as TD_WRITE                                                          |
-| NSCMD_TD_WRITE64 | Custom large write             | same as TD_WRITE                                                          |
-| TD_FORMAT        | Format filesystem              | acquire semaphore → format → flush → release → notify                     |
-| TD_FORMAT64      | Large format variant           | same as TD_FORMAT                                                         |
-| CMD_WRITE        | Custom write command           | same as TD_WRITE                                                          |
-| CMD_UPDATE       | Metadata refresh / FAT reload  | acquire semaphore → refresh metadata → release → notify                   |
-| CMD_CLEAR        | Clear sectors / zero blocks    | acquire semaphore → clear → flush → release → notify                      |
-| TD_REMOVE        | File or directory deletion     | acquire semaphore → remove → flush → release → notify                     |
-| CMD_RESET        | Reset interface / driver state | acquire semaphore → reset → release → notify                              |
-| CMD_ACQUIRE_SEM  | Explicit acquire semaphore     | acquire semaphore → respond OK                                            |
-| CMD_RELEASE_SEM  | Explicit release semaphore     | release semaphore → respond OK                                            |
+| Command           | Critical? | Handling Notes                                                            |
+| ----------------- | --------- | ------------------------------------------------------------------------- |
+| CMD_RESET         | YES       | Acquire semaphore → reset driver/SD → flush → release → notify other core |
+| CMD_READ          | NO        | Read-only; handle normally; optional brief semaphore for consistent read  |
+| CMD_WRITE         | YES       | Acquire semaphore → write → flush → release → notify                      |
+| CMD_UPDATE        | YES       | Acquire semaphore → refresh FAT/dir → release → notify                    |
+| CMD_CLEAR         | YES       | Acquire semaphore → clear blocks → flush → release → notify               |
+| TD_MOTOR          | NO        | Drive motor on/off; handle normally                                       |
+| TD_FORMAT         | YES       | Acquire semaphore → format → flush → release → notify                     |
+| TD_REMOVE         | YES       | Acquire semaphore → remove file/dir → flush → release → notify            |
+| TD_CHANGENUM      | NO        | Metadata only; handle normally                                            |
+| TD_CHANGESTATE    | NO        | Status only; handle normally                                              |
+| TD_PROTSTATUS     | NO        | Status only; handle normally                                              |
+| TD_GETDRIVETYPE   | NO        | Status only; handle normally                                              |
+| TD_ADDCHANGEINT   | NO        | Subscribe to change interrupts; handle normally                           |
+| TD_REMCHANGEINT   | NO        | Remove change interrupts; handle normally                                 |
+| TD_GETGEOMETRY    | NO        | Query geometry; handle normally                                           |
+| TD_READ64         | NO        | Read-only; handle normally; optional semaphore for consistency            |
+| TD_WRITE64        | YES       | Acquire semaphore → write → flush → release → notify                      |
+| TD_FORMAT64       | YES       | Acquire semaphore → format variant → flush → release → notify             |
+| NSCMD_DEVICEQUERY | NO        | Status/control only; handle normally                                      |
+| NSCMD_TD_READ64   | NO        | Read-only; handle normally; optional semaphore for consistency            |
+| NSCMD_TD_WRITE64  | YES       | Acquire semaphore → write → flush → release → notify                      |
 
 ---
 
-## RP2350 Firmware: Core 0 (FTP Server) and Core 1 (par_spi.c) Integration
+## RP2350 Firmware Integration
 
-### 1. Main Firmware (`main.c`) integrating par_spi.c
+### Main Firmware (`main.c`)
 
 ```c
 #include "pico/multicore.h"
 #include "pico/sem.h"
 #include "SdFat.h"
-#include "par_spi.h" // include current par_spi.c header
+#include "par_spi.h"
 
 semaphore_t sd_fs_sem;
 
 int main() {
-    // Initialize SD card and semaphore
     sd.begin();
     init_sd_fs_sem();
-    ftp_server_init(); // Core 0 FTP server
+    ftp_server_init();
 
-    // Launch par_spi application on Core 1
+    // Launch par_spi on Core 1
     multicore_launch_core1(par_spi_main_core1);
 
     while(1) {
-        // Check if Amiga has modified media
         check_dirty_and_refresh();
 
-        // FTP server operations
         acquire_sd_fs();
+        // FTP server operations
         f_open(...);
         f_write(...);
         f_close(...);
@@ -78,12 +85,12 @@ int main() {
 }
 ```
 
-### 2. Core 1: par_spi.c integrated for semaphore handling
+### Core 1: par_spi.c Integration
 
 ```c
 #include "par_spi.h"
 #include "pico/sem.h"
-#include "sd_fs_sem.h" // shared semaphore
+#include "sd_fs_sem.h"
 
 void par_spi_main_core1() {
     par_spi_init();
@@ -92,45 +99,61 @@ void par_spi_main_core1() {
         uint8_t cmd = par_spi_poll();
 
         switch(cmd) {
+            // Semaphore control
             case CMD_ACQUIRE_SEM:
                 sem_acquire_blocking(&sd_fs_sem);
                 par_spi_send_status(STATUS_OK);
                 break;
-
             case CMD_RELEASE_SEM:
                 sem_release(&sd_fs_sem);
                 par_spi_send_status(STATUS_OK);
                 break;
 
-            case TD_WRITE:
-            case TD_WRITE64:
-            case NSCMD_TD_WRITE64:
-            case TD_FORMAT:
-            case TD_FORMAT64:
+            // Critical commands
+            case CMD_RESET:
             case CMD_WRITE:
             case CMD_UPDATE:
             case CMD_CLEAR:
+            case TD_FORMAT:
             case TD_REMOVE:
-            case CMD_RESET:
+            case TD_WRITE64:
+            case TD_FORMAT64:
+            case NSCMD_TD_WRITE64:
                 sem_acquire_blocking(&sd_fs_sem);
-                handle_command(cmd, ...); // original par_spi.c command handling
+                handle_command(cmd, ...);
                 sem_release(&sd_fs_sem);
-                par_spi_send_command(CMD_DIRTY); // notify FTP core
+                par_spi_send_command(CMD_DIRTY);
+                break;
+
+            // Read-only / status / control commands
+            case CMD_READ:
+            case TD_READ64:
+            case NSCMD_TD_READ64:
+            case TD_MOTOR:
+            case TD_CHANGENUM:
+            case TD_CHANGESTATE:
+            case TD_PROTSTATUS:
+            case TD_GETDRIVETYPE:
+            case TD_ADDCHANGEINT:
+            case TD_REMCHANGEINT:
+            case TD_GETGEOMETRY:
+            case NSCMD_DEVICEQUERY:
+                handle_command(cmd, ...);
                 break;
 
             default:
-                // Read-only or status commands handled normally
+                // unknown command handling
                 break;
         }
     }
 }
 ```
 
-**Notes:**
+### Notes
 
-* The existing `par_spi.c` logic is preserved inside `handle_command()` calls.
-* Semaphore ensures that any critical SD card operation from the Amiga is serialized with FTP server operations.
-* Core 1 is exclusively running `par_spi_main_core1`, while Core 0 runs FTP server and handles media refresh.
+* All currently used commands in `device.c` are accounted for.
+* Semaphore is used only for commands that modify SD card content or filesystem metadata.
+* Read and status commands are handled normally; optional semaphore acquisition can ensure consistency if required.
 
 ---
 
@@ -139,7 +162,7 @@ void par_spi_main_core1() {
 ```
 Core 0 (FTP) --- check_dirty_and_refresh() ---> refresh local FS
 Core 1 (par_spi) --- CMD_ACQUIRE_SEM / CMD_DIRTY ---> Core 0 semaphore
-Amiga SPI commands ----> Core 1 handled via semaphore
+Amiga SPI commands ----> Core 1 handled for all commands
 ```
 
-This integration allows the **current par_spi.c implementation to run on Core 1** safely while using the semaphore to synchronize SD card access with the FTP server on Core 0.
+This ensures **full command handling with safe multi-core SD card synchronization**.
