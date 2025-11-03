@@ -9,6 +9,8 @@ This strategy enables safe bidirectional access to a single SD card shared betwe
 
 Both cores share the same SPI bus. The goal is to allow **all commands** currently used in `device.c` to be handled safely, with critical commands protected by a semaphore.
 
+Explicit core assignment ensures safe separation of tasks: Core 0 = FTP server, Core 1 = Amiga SPI interface.
+
 ---
 
 ## Key Principles
@@ -19,6 +21,10 @@ Both cores share the same SPI bus. The goal is to allow **all commands** current
    * RP2350 writes → Amiga refresh (TD_UPDATE)
    * Amiga writes → RP2350 refresh (SdFat or FatFS remount/reopen)
 3. **Global semaphore for SD/FS access:** All filesystem-modifying operations use a semaphore to ensure only one core accesses the SD card at a time.
+4. **Explicit Core Assignment:**
+
+   * Core 0: runs `main()` and the FTP server loop (`ftp_server_init()` / `ftp_server_loop()`).
+   * Core 1: runs `par_spi_main_core1()` launched via `multicore_launch_core1()`.
 
 ---
 
@@ -52,7 +58,7 @@ Both cores share the same SPI bus. The goal is to allow **all commands** current
 
 ## RP2350 Firmware Integration
 
-### Main Firmware (`main.c`)
+### Main Firmware (`main.c`) - Core 0 (FTP server)
 
 ```c
 #include "pico/multicore.h"
@@ -65,7 +71,7 @@ semaphore_t sd_fs_sem;
 int main() {
     sd.begin();
     init_sd_fs_sem();
-    ftp_server_init();
+    ftp_server_init(); // Runs on Core 0
 
     // Launch par_spi on Core 1
     multicore_launch_core1(par_spi_main_core1);
@@ -84,6 +90,9 @@ int main() {
     }
 }
 ```
+
+* Core 0 runs FTP server only.
+* Core 1 is exclusively reserved for `par_spi_main_core1()`.
 
 ### Core 1: par_spi.c Integration
 
@@ -151,9 +160,9 @@ void par_spi_main_core1() {
 
 ### Notes
 
-* All currently used commands in `device.c` are accounted for.
-* Semaphore is used only for commands that modify SD card content or filesystem metadata.
-* Read and status commands are handled normally; optional semaphore acquisition can ensure consistency if required.
+* Explicit core assignment guarantees **FTP server runs on Core 0** and `par_spi` runs on Core 1.
+* Critical commands use the semaphore to protect SD card / filesystem modifications.
+* Read/status commands are handled normally; optional semaphore can ensure consistent reads if needed.
 
 ---
 
@@ -162,7 +171,7 @@ void par_spi_main_core1() {
 ```
 Core 0 (FTP) --- check_dirty_and_refresh() ---> refresh local FS
 Core 1 (par_spi) --- CMD_ACQUIRE_SEM / CMD_DIRTY ---> Core 0 semaphore
-Amiga SPI commands ----> Core 1 handled for all commands
+Amiga SPI commands ----> Core 1 handles all commands
 ```
 
-This ensures **full command handling with safe multi-core SD card synchronization**.
+This setup ensures **full command handling with safe multi-core SD card synchronization** and clearly separates Core 0 (FTP) and Core 1 (Amiga SPI).
