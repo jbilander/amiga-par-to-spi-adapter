@@ -4,21 +4,7 @@
  * Runs on RP2040 microcontroller instead of AVR as before,
  * but uses the same protocol and Amiga software.
  */
-#include "hardware/gpio.h"
-#include "hardware/spi.h"
-
-//      Pin name    GPIO    Direction   Comment     Description
-#define PIN_D(x)    (0+x)   // In/out
-#define PIN_IRQ     8       // Output   Active low
-#define PIN_ACT     9       // Output   Active low
-#define PIN_CLK     10      // Input
-#define PIN_REQ     11      // Input    Active low
-#define PIN_MISO    16      // Input    Pull-up
-#define PIN_SS      17      // Output   Active low
-#define PIN_SCK     18      // Output
-#define PIN_MOSI    19      // Output
-#define PIN_CDET    20      // Input    Pull-up     Card Detect
-#define PIN_LED     28      // Output
+#include "main.h"
 
 #define SPI_SLOW_FREQUENCY (400*1000)
 #define SPI_FAST_FREQUENCY (16*1000*1000)
@@ -172,7 +158,7 @@ static void handle_request() {
     }
 }
 
-int main() {
+void par_spi_main() {
     spi_init(spi0, SPI_SLOW_FREQUENCY);
 
     gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
