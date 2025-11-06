@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include "pico/stdlib.h"
+#include "pico/mutex.h"
 #include "pico/multicore.h"
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
@@ -19,6 +20,9 @@
 #define PIN_MOSI    19      // Output
 #define PIN_CDET    20      // Input    Pull-up     Card Detect
 #define PIN_LED     28      // Output
+
+extern mutex_t spi_mutex;   // SPI bus lock
+extern volatile bool amiga_wrote_to_card; // Flag set when Amiga writes to SD
 
 void par_spi_main(void);
 void ftp_server_main(void);

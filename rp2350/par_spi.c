@@ -57,6 +57,7 @@ static void handle_request() {
             byte_count |= pins & 0x7f;
             prev_clk = pins & (1 << PIN_CLK);
         }
+        mutex_enter_blocking(&spi_mutex); //SPI lock
 
         if (read) {
             spi_get_hw(spi0)->dr = 0xff;
@@ -112,7 +113,9 @@ static void handle_request() {
                 prev_clk = pins & (1 << PIN_CLK);
                 byte_count--;
             }
+            amiga_wrote_to_card = true;
         }
+        mutex_exit(&spi_mutex); //SPI unlock
     } else {
         switch ((pins & 0x3e) >> 1) {
             case 0: { // SPI_SELECT

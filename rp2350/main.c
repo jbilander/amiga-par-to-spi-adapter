@@ -1,5 +1,8 @@
 #include "main.h"
 
+mutex_t spi_mutex;
+volatile bool amiga_wrote_to_card = false;
+
 extern void par_spi_main(void);
 extern void ftp_server_main(void);
 
@@ -14,6 +17,7 @@ void core0_entry() {
 }
 
 int main() {
+    mutex_init(&spi_mutex);
     multicore_launch_core1(core1_entry);
     core0_entry();  // never returns
     return 0;
