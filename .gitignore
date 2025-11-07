@@ -1,3 +1,4 @@
+.DS_Store
 .vscode
 esp32/build
 rp2040/build
