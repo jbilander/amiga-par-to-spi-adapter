@@ -2,11 +2,7 @@
 #define MAIN_H
 
 #include <stdio.h>
-#include "pico/stdlib.h"
 #include "pico/mutex.h"
-#include "pico/multicore.h"
-#include "hardware/gpio.h"
-#include "hardware/spi.h"
 
 //      Pin name    GPIO    Direction   Comment     Description
 #define PIN_D(x)    (0+x)   // In/out
@@ -20,6 +16,9 @@
 #define PIN_MOSI    19      // Output
 #define PIN_CDET    20      // Input    Pull-up     Card Detect
 #define PIN_LED     28      // Output
+
+#define SPI_SLOW_FREQUENCY (400*1000)
+#define SPI_FAST_FREQUENCY (16*1000*1000)
 
 extern mutex_t spi_mutex;   // SPI bus lock
 extern volatile bool amiga_wrote_to_card; // Flag set when Amiga writes to SD

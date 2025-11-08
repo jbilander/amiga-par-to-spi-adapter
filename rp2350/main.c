@@ -1,4 +1,8 @@
 #include "main.h"
+#include "pico/stdlib.h"
+#include "pico/multicore.h"
+#include "hardware/gpio.h"
+#include "hardware/spi.h"
 
 mutex_t spi_mutex;
 volatile bool amiga_wrote_to_card = false;

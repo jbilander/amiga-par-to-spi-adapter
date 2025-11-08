@@ -5,9 +5,8 @@
  * but uses the same protocol and Amiga software.
  */
 #include "main.h"
-
-#define SPI_SLOW_FREQUENCY (400*1000)
-#define SPI_FAST_FREQUENCY (16*1000*1000)
+#include "hardware/gpio.h"
+#include "hardware/spi.h"
 
 static uint32_t prev_cdet;
 
