@@ -16,9 +16,11 @@ add_library(fatfs
     lib/fatfs/source/ff.c
     lib/fatfs/source/ffsystem.c
     lib/fatfs/source/ffunicode.c
+    lib/fatfs/source/diskio.c
 )
 
 target_include_directories(fatfs PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/lib/fatfs/source
     ${CMAKE_CURRENT_SOURCE_DIR}/build/generated/pico_base
     include_directories(${PICO_SDK_PATH}/src/common/pico_sync/include)
@@ -35,6 +37,9 @@ target_include_directories(fatfs PUBLIC
     include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_base/include)
     include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_sync/include)
     include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_sync_spin_lock/include)
+    include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_spi/include)
+    include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_gpio/include)
+    include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_irq/include)
     include_directories(${PICO_SDK_PATH}/src/common/pico_time/include)
 )
 
