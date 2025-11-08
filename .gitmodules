@@ -1,3 +1,3 @@
 [submodule "rp2350/lib/fatfs"]
 	path = rp2350/lib/fatfs
-	url = https://github.com/abbrev/fatfs.git
+	url = https://github.com/jbilander/fatfs.git
