@@ -1,4 +1,11 @@
 #include "main.h"
+#include "ff.h"
+#include <string.h>
+
+// Global FatFs objects
+static FATFS fs;
+static FIL file;
+
 
 // --- FTP server main loop (runs on Core 1) ---
 void ftp_server_main(void) {

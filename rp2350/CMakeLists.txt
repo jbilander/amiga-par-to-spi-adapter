@@ -11,11 +11,38 @@ pico_sdk_init()
 
 add_compile_options(-Wall) 
 
+# === FatFs library ===
+add_library(fatfs
+    lib/fatfs/source/ff.c
+    lib/fatfs/source/ffsystem.c
+    lib/fatfs/source/ffunicode.c
+)
+
+target_include_directories(fatfs PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/lib/fatfs/source
+    ${CMAKE_CURRENT_SOURCE_DIR}/build/generated/pico_base
+    include_directories(${PICO_SDK_PATH}/src/common/pico_sync/include)
+    include_directories(${PICO_SDK_PATH}/src/common/pico_base/include)
+    include_directories(${PICO_SDK_PATH}/src/common/pico_base_headers/include)
+    include_directories(${PICO_SDK_PATH}/src/rp2350/pico_platform/include)
+    include_directories(${PICO_SDK_PATH}/src/rp2350/hardware_regs/include)
+    include_directories(${PICO_SDK_PATH}/src/rp2350/hardware_structs/include)
+    include_directories(${PICO_SDK_PATH}/src/rp2_common/pico_platform_compiler/include)
+    include_directories(${PICO_SDK_PATH}/src/rp2_common/pico_platform_sections/include)
+    include_directories(${PICO_SDK_PATH}/src/rp2_common/pico_platform_panic/include)
+    include_directories(${PICO_SDK_PATH}/src/rp2_common/pico_platform_common/include)
+    include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_timer/include)
+    include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_base/include)
+    include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_sync/include)
+    include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_sync_spin_lock/include)
+    include_directories(${PICO_SDK_PATH}/src/common/pico_time/include)
+)
+
 add_executable(${PROJECT} ftp_server.c par_spi.c main.c)
 
 pico_add_extra_outputs(${PROJECT})
 
-target_link_libraries(${PROJECT} pico_stdlib hardware_spi pico_multicore)
+target_link_libraries(${PROJECT} pico_stdlib hardware_spi hardware_sync pico_multicore fatfs)
 
 if (PICO_CYW43_SUPPORTED)
 	target_link_libraries(${PROJECT} pico_cyw43_arch_none)
