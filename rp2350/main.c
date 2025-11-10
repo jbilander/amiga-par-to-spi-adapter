@@ -21,6 +21,10 @@ void core0_entry() {
 }
 
 int main() {
+    stdio_init_all();
+    sleep_ms(2000); // allow time for macOS to enumerate USB
+    printf("Pico USB serial active\n");
+	
     mutex_init(&spi_mutex);
     multicore_launch_core1(core1_entry);
     core0_entry();  // never returns
