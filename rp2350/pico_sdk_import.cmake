@@ -35,7 +35,7 @@ if (NOT PICO_SDK_PATH)
                     pico_sdk
                     GIT_REPOSITORY https://github.com/raspberrypi/pico-sdk
                     GIT_TAG master
-                    GIT_SUBMODULES_RECURSE FALSE
+                    GIT_SUBMODULES_RECURSE TRUE
             )
         else ()
             FetchContent_Declare(
