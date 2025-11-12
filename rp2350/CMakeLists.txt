@@ -19,43 +19,45 @@ add_library(fatfs
     lib/fatfs/source/diskio.c
 )
 
+target_link_libraries(fatfs PUBLIC
+    pico_stdlib
+    hardware_spi
+)
+
 target_include_directories(fatfs PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/lib/fatfs/source
-    ${CMAKE_CURRENT_SOURCE_DIR}/build/generated/pico_base
-    include_directories(${PICO_SDK_PATH}/src/common/pico_sync/include)
-    include_directories(${PICO_SDK_PATH}/src/common/pico_base/include)
-    include_directories(${PICO_SDK_PATH}/src/common/pico_base_headers/include)
-    include_directories(${PICO_SDK_PATH}/src/common/pico_stdlib_headers/include)
-    include_directories(${PICO_SDK_PATH}/src/rp2350/pico_platform/include)
-    include_directories(${PICO_SDK_PATH}/src/rp2350/hardware_regs/include)
-    include_directories(${PICO_SDK_PATH}/src/rp2350/hardware_structs/include)
-    include_directories(${PICO_SDK_PATH}/src/rp2_common/pico_platform_compiler/include)
-    include_directories(${PICO_SDK_PATH}/src/rp2_common/pico_platform_sections/include)
-    include_directories(${PICO_SDK_PATH}/src/rp2_common/pico_platform_panic/include)
-    include_directories(${PICO_SDK_PATH}/src/rp2_common/pico_platform_common/include)
-    include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_timer/include)
-    include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_base/include)
-    include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_sync/include)
-    include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_sync_spin_lock/include)
-    include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_spi/include)
-    include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_gpio/include)
-    include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_irq/include)
-    include_directories(${PICO_SDK_PATH}/src/rp2_common/pico_stdio/include)
-    include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_uart/include)
-    include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_resets/include)
-    include_directories(${PICO_SDK_PATH}/src/rp2_common/hardware_rtc/include)
-    include_directories(${PICO_SDK_PATH}/src/common/pico_time/include)
 )
 
-add_executable(${PROJECT} ftp_server.c par_spi.c main.c)
+add_executable(${PROJECT} ftp_server.c par_spi.c main.c util.c)
+
+# --- Wi-Fi credentials from local wifi_credentials.cmake file ---
+include(${CMAKE_SOURCE_DIR}/wifi_credentials.cmake OPTIONAL)
+
+target_compile_definitions(${PROJECT} PRIVATE
+    WIFI_SSID="${WIFI_SSID}"
+    WIFI_PASSWORD="${WIFI_PASSWORD}"
+)
+
+target_include_directories(${PROJECT} PRIVATE
+    ${PICO_SDK_PATH}/src/rp2_common/pico_cyw43_arch/include
+    ${PICO_SDK_PATH}/src/rp2_common/pico_lwip/include
+    ${PICO_SDK_PATH}/src/rp2_common/pico_rand/include
+    ${PICO_SDK_PATH}/src/rp2_common/pico_async_context/include
+    ${PICO_SDK_PATH}/lib/lwip/src/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
 
 pico_add_extra_outputs(${PROJECT})
-pico_enable_stdio_usb(par_spi_ftp_server 1)
-pico_enable_stdio_uart(par_spi_ftp_server 0)
+pico_enable_stdio_usb(${PROJECT} 1)
+pico_enable_stdio_uart(${PROJECT} 0)
 
-target_link_libraries(${PROJECT} pico_stdlib hardware_spi hardware_sync pico_multicore fatfs pico_util)
-
-if (PICO_CYW43_SUPPORTED)
-	target_link_libraries(${PROJECT} pico_cyw43_arch_none)
-endif()
+target_link_libraries(${PROJECT}
+    pico_stdlib
+    hardware_spi
+    hardware_sync
+    pico_multicore
+    fatfs
+    pico_util
+    pico_cyw43_arch_lwip_threadsafe_background
+)
