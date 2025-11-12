@@ -1,19 +1,17 @@
 #include "main.h"
 #include "pico/stdlib.h"
-//#include "pico/util/datetime.h"
-//#include "hardware/rtc.h"
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
-#include "ff.h"        // FatFs main header
+#include "ff.h"
 #include <string.h>
+#include "util.h"
 
-// FatFs objects (global or static)
 static FATFS fs;       // Filesystem object
 static FIL file;       // File object
 static FRESULT fr;     // FatFs return code
 
 DWORD get_fattime(void) {
-    DWORD year = (2024 - 1980) << 25;
+    DWORD year = (2025 - 1980) << 25;
     DWORD month = 1 << 21;
     DWORD day = 1 << 16;
     return year | month | day;
@@ -40,38 +38,28 @@ void ftp_server_main(void) {
             gpio_put(PIN_LED, 0);
             sleep_ms(100);
         }
-    } else {
-        fr = f_setcp(850); // Set the OEM code page to Windows-1252 (ANSI)
     }
 
-    // --- Example: Create a new file with long Latin-1 filename ---
-    const TCHAR *filename = "Testfil_åäö_longname.txt";  // UTF-8 works; Latin-1 chars accepted
-    fr = f_open(&file, filename, FA_CREATE_ALWAYS | FA_WRITE);
+    const char *utf8_filename = "Nordic_ÅÄÖ.txt";
+    fr = f_open(&file, utf8_filename, FA_WRITE | FA_CREATE_ALWAYS);
+
     if (fr == FR_OK) {
 
-        UINT bytes_written;
-        fr = f_write(&file, "Hello from FatFs!\r\n", 19, &bytes_written);
-        printf("Debug: f_write result=%d, bytes_written=%u\n", fr, bytes_written);
+        const char *utf8_text = "Testing Nordic characters: Ångström, Äpple, Örebro. This will display correctly on the Amiga side.\n";
+        char latin1_text[256];
+        utf8_to_latin1(utf8_text, latin1_text, sizeof(latin1_text));
 
-        fr = f_sync(&file);
-        printf("Debug: f_sync result=%d\n", fr);
+        UINT bw;
+        f_write(&file, latin1_text, strlen(latin1_text), &bw);
+
+        //fr = f_sync(&file);
+        //printf("Debug: f_sync result=%d\n", fr);
 
         fr = f_close(&file);
         printf("Debug: f_close result=%d\n", fr);
 
-        /*
-        const char *text = "Hej världen!\r\nThis is a FatFs test file with long filename.\r\n";
-        UINT bw;
-        f_write(&file, text, strlen(text), &bw);
-        f_close(&file);
-
-        // Optional: verify success
-        if (bw == strlen(text)) {
-            gpio_put(PIN_LED, 1); // success indicator
-        }
-        */
     } else {
-        // Could not create file, blink LED slowly
+        // Could not create file, blink LED
         while (1) {
             gpio_put(PIN_LED, 1);
             sleep_ms(500);
@@ -85,7 +73,6 @@ void ftp_server_main(void) {
 
     // --- Main FTP loop placeholder ---
     while (1) {
-        // Here you will later handle FTP commands like STOR, RETR, LIST, etc.
         // For now, toggle LED every 2s
         gpio_put(PIN_LED, 1);
         sleep_ms(2000);
