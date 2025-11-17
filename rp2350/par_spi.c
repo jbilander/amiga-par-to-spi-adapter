@@ -8,6 +8,9 @@
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
 
+/* Shared SPI mutex declared in main.h */
+extern mutex_t spi_mutex;
+
 static uint32_t prev_cdet;
 
 static void handle_request() {
@@ -36,12 +39,10 @@ static void handle_request() {
             byte_count = pins & 0x3f;
 
             gpio_put(PIN_ACT, 0);
-            gpio_put(PIN_LED, 1);
         } else { // READ2 or WRITE2
             byte_count = (pins & 0x3f) << 7;
 
             gpio_put(PIN_ACT, 0);
-            gpio_put(PIN_LED, 1);
 
             while (1) {
                 pins = gpio_get_all();
@@ -57,6 +58,7 @@ static void handle_request() {
             prev_clk = pins & (1 << PIN_CLK);
         }
         mutex_enter_blocking(&spi_mutex); //SPI lock
+        gpio_put(PIN_LED, 1);
 
         if (read) {
             spi_get_hw(spi0)->dr = 0xff;
@@ -115,18 +117,17 @@ static void handle_request() {
             amiga_wrote_to_card = true;
         }
         mutex_exit(&spi_mutex); //SPI unlock
+        gpio_put(PIN_LED, 0);
     } else {
         switch ((pins & 0x3e) >> 1) {
             case 0: { // SPI_SELECT
                 gpio_put(PIN_SS, !(pins & 1));
                 gpio_put(PIN_ACT, 0);
-                gpio_put(PIN_LED, 1);
                 break;
             }
             case 1: { // CARD_PRESENT
                 gpio_set_dir(PIN_IRQ, false);
                 gpio_put(PIN_ACT, 0);
-                gpio_put(PIN_LED, 1);
 
                 while (1) {
                     pins = gpio_get_all();
@@ -147,7 +148,6 @@ static void handle_request() {
                         SPI_SLOW_FREQUENCY);
 
                 gpio_put(PIN_ACT, 0);
-                gpio_put(PIN_LED, 1);
                 break;
             }
         }
@@ -181,9 +181,6 @@ void par_spi_main() {
     gpio_put(PIN_ACT, 1);
     gpio_set_dir(PIN_ACT, GPIO_OUT);
 
-    gpio_init(PIN_LED);
-    gpio_set_dir(PIN_LED, GPIO_OUT);
-
     prev_cdet = gpio_get_all() & (1 << PIN_CDET);
 
     while (1) {
@@ -193,7 +190,6 @@ void par_spi_main() {
         gpio_clr_mask(0xff);
 
         gpio_put(PIN_ACT, 1);
-        gpio_put(PIN_LED, 0);
 
         while (spi_is_busy(spi0))
             tight_loop_contents();
