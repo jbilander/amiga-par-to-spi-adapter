@@ -97,7 +97,7 @@ int main() {
 
     // Start slow blink timer (connected indicator)
     static repeating_timer_t wifi_led_timer;
-    add_repeating_timer_ms(500, wifi_led_timer_cb, NULL, &wifi_led_timer);
+    add_repeating_timer_ms(1000, wifi_led_timer_cb, NULL, &wifi_led_timer);
 
     // --- End Wi-Fi Initialization ---
     printf("Connected!\n");
