@@ -4,9 +4,11 @@
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
 #include "hardware/pio.h"
+#include "par_amiga.pio.h"
 #include "pico/cyw43_arch.h"
 #include "lwip/netif.h"
 #include "lwip/ip4_addr.h"
+
 
 mutex_t spi_mutex;
 volatile bool amiga_wrote_to_card = false;
@@ -57,6 +59,30 @@ void core0_entry() {
     ftp_server_main();
 }
 
+static void par_amiga_pio_test_init() {
+    printf("[PIO TEST] Init start\n");
+
+    // Claim PIO1 manually (not using default allocator)
+    PIO pio = pio1;
+    int sm = pio_claim_unused_sm(pio, false);
+    if (sm < 0) {
+        printf("[PIO TEST] ERROR: No free SM in PIO1!\n");
+        return;
+    }
+
+    uint offset = pio_add_program(pio, &par_amiga_test_program);
+    printf("[PIO TEST] Program loaded at offset %u on SM %d\n", offset, sm);
+
+    // Setup GPIO pin for test output: choose any free pin (example: GPIO 6)
+    const uint TEST_PIN = 28;
+    gpio_set_function(TEST_PIN, GPIO_FUNC_PIO1);
+
+    par_amiga_test_program_init(pio, sm, offset, TEST_PIN);
+
+    printf("[PIO TEST] Running on PIO1 SM%d\n", sm);
+}
+
+
 int main() {
     stdio_init_all();
 
@@ -104,6 +130,8 @@ int main() {
 
     struct netif *netif = &cyw43_state.netif[CYW43_ITF_STA];
     printf("IP address: %s\n", ip4addr_ntoa(netif_ip4_addr(netif)));
+
+    par_amiga_pio_test_init();
 
     mutex_init(&spi_mutex);
 

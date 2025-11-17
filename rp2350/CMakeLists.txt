@@ -31,6 +31,8 @@ target_include_directories(fatfs PUBLIC
 
 add_executable(${PROJECT} ftp_server.c par_spi.c main.c util.c)
 
+pico_generate_pio_header(${PROJECT} ${CMAKE_CURRENT_LIST_DIR}/par_amiga_rx.pio)
+
 # --- Wi-Fi credentials from local wifi_credentials.cmake file ---
 include(${CMAKE_SOURCE_DIR}/wifi_credentials.cmake OPTIONAL)
 
