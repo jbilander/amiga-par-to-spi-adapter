@@ -1,38 +1,36 @@
-.program par_amiga_test
-.side_set 1 opt        ; <-- sideset is now OPTIONAL
+.program par_amiga_rx
+; Sample on both edges of CLK (POUT GPIO10), push an 8-bit sample per edge, while REQ (SELECT GPIO11) is low.
+
+init:
+    ; Wait for REQ to go active (LOW)
+    wait 0 pin 11
+    wait 0 pin 10
 
 .wrap_target
-    set pins, 1 side 0     ; LED ON (or test pin high)
-    set x, 25
-delay_high:
-    jmp x-- delay_high side 0
 
-    set pins, 0 side 0     ; LED OFF (or test pin low)
-    set x, 25
-delay_low:
-    jmp x-- delay_low side 0
+idle_for_req:
+    wait 0 pin 11
 
-;    jmp wrap_target
+start_sampling:
+    ; Check REQ *before* waiting for the next CLK edge
+    jmp pin exit_to_wrap ; Jumps to the instruction before .wrap
+
+    ; ----- RISING edge SAMPLE -------
+    wait 1 pin 10
+    in   pins, 8
+    push block
+
+    ; Check STROBE again mid-cycle
+    jmp pin exit_to_wrap
+
+    ; ----- FALLING edge SAMPLE -------
+    wait 0 pin 10
+    in   pins, 8
+    push block
+
+    jmp start_sampling
+
+exit_to_wrap:
+    nop
+
 .wrap
-
-% c-sdk {
-#include "hardware/pio.h"
-
-static inline void par_amiga_test_program_init(PIO pio, uint sm, uint offset, uint pin) {
-    // Configure pin
-    pio_gpio_init(pio, pin);
-    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
-
-    // Load default config
-    pio_sm_config c = par_amiga_test_program_get_default_config(offset);
-
-    // Configure SET and optional sideset pins
-    sm_config_set_set_pins(&c, pin, 1);
-    sm_config_set_sideset(&c, 1, true, false); // 1 bit, optional, no pindirs
-
-    // Init & start SM
-    pio_sm_init(pio, sm, offset, &c);
-    pio_sm_set_enabled(pio, sm, true);
-}
-%}
-

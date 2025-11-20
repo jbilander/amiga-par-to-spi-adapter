@@ -4,7 +4,7 @@
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
 #include "hardware/pio.h"
-#include "par_amiga.pio.h"
+#include "par_amiga_rx.pio.h"
 #include "pico/cyw43_arch.h"
 #include "lwip/netif.h"
 #include "lwip/ip4_addr.h"
@@ -16,29 +16,6 @@ volatile bool amiga_wrote_to_card = false;
 void par_spi_main(void);
 void ftp_server_main(void);
 
-// Debug print of detected CYW43 PIO configuration
-void debug_dump_cyw43_pio_config(void) {
-
-    // Probe PIO state machines
-    PIO pios[] = {pio0, pio1, pio2};
-    const char* names[] = {"PIO0","PIO1","PIO2"};
-
-    printf("\n=== PIO State Machine Status ===\n");
-    for (int i = 0; i < 3; i++) {
-        bool used = false;
-        printf("%s: ", names[i]);
-        for (int sm = 0; sm < 4; sm++) {
-            if (pio_sm_is_claimed(pios[i], sm)) {
-                printf("SM%d ", sm);
-                used = true;
-            }
-        }
-        if (!used) printf("FREE");
-        printf("\n");
-    }
-    printf("================================\n\n");
-}
-
 // --- LED blink timer callback ---
 static bool wifi_led_timer_cb(repeating_timer_t *rt) {
     static bool state = false;
@@ -47,41 +24,16 @@ static bool wifi_led_timer_cb(repeating_timer_t *rt) {
     return true; // keep repeating
 }
 
-// --- Core 0 entry (Amiga SPI bridge) ---
+// --- Core 1 entry (FTP server) ---
 void core1_entry() {
-    printf("Start Amiga SPI bridge\n");
+    printf("Start FTP Server\n");
+    //ftp_server_main();
+}
+
+// --- Core 0 entry (Amiga SPI bridge) ---
+void core0_entry() {
     par_spi_main();
 }
-
-// --- Core 1 entry (FTP server) ---
-void core0_entry() {
-    printf("Start FTP Server\n");
-    ftp_server_main();
-}
-
-static void par_amiga_pio_test_init() {
-    printf("[PIO TEST] Init start\n");
-
-    // Claim PIO1 manually (not using default allocator)
-    PIO pio = pio1;
-    int sm = pio_claim_unused_sm(pio, false);
-    if (sm < 0) {
-        printf("[PIO TEST] ERROR: No free SM in PIO1!\n");
-        return;
-    }
-
-    uint offset = pio_add_program(pio, &par_amiga_test_program);
-    printf("[PIO TEST] Program loaded at offset %u on SM %d\n", offset, sm);
-
-    // Setup GPIO pin for test output: choose any free pin (example: GPIO 6)
-    const uint TEST_PIN = 28;
-    gpio_set_function(TEST_PIN, GPIO_FUNC_PIO1);
-
-    par_amiga_test_program_init(pio, sm, offset, TEST_PIN);
-
-    printf("[PIO TEST] Running on PIO1 SM%d\n", sm);
-}
-
 
 int main() {
     stdio_init_all();
@@ -105,9 +57,7 @@ int main() {
         }
     }
 
-    debug_dump_cyw43_pio_config();
     cyw43_arch_enable_sta_mode();
-    debug_dump_cyw43_pio_config();
 
     printf("Connecting to %s...\n", WIFI_SSID);
     if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD,
@@ -130,8 +80,6 @@ int main() {
 
     struct netif *netif = &cyw43_state.netif[CYW43_ITF_STA];
     printf("IP address: %s\n", ip4addr_ntoa(netif_ip4_addr(netif)));
-
-    par_amiga_pio_test_init();
 
     mutex_init(&spi_mutex);
 
