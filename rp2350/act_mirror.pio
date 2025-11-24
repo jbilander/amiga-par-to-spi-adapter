@@ -1,0 +1,48 @@
+.program act_mirror
+set pins, 1
+.wrap_target
+    wait 0 gpio 11      ; Wait for REQ low
+    set pins, 0         ; ACT = LOW
+    wait 1 gpio 11      ; Wait for REQ high
+    set pins, 1         ; ACT = HIGH
+.wrap
+
+% c-sdk {
+#include "hardware/pio.h"
+
+/*
+ * Initialize the act_mirror PIO program.
+ *
+ * - pin_req  = GPIO where REQ is connected (input)
+ * - pin_act  = GPIO where ACT (BUSY) is output
+ *
+ * PIO program uses:
+ *   - wait gpio → reads absolute GPIO number
+ *   - set pins  → writes to the SM's pin group, so we must
+ *     configure the pin group to consist of exactly 1 pin: ACT.
+ */
+static inline void act_mirror_program_init(
+        PIO pio, uint sm, uint offset,
+        uint pin_req, uint pin_act)
+{
+    // Load default config
+    pio_sm_config c = act_mirror_program_get_default_config(offset);
+
+    // Tell the SM that 'set pins' should write to ACT pin only
+    sm_config_set_set_pins(&c, pin_act, 1);
+
+    // Configure ACT pin as output
+    pio_gpio_init(pio, pin_act);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_act, 1, true); // output
+
+    // Configure REQ pin as input (needed for wait gpio)
+    pio_gpio_init(pio, pin_req);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_req, 1, false); // input
+
+    // Apply configuration
+    pio_sm_init(pio, sm, offset, &c);
+
+    // Enable the state machine
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
