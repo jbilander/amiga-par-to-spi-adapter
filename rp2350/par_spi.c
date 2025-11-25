@@ -168,9 +168,7 @@ static void handle_request() {
                 byte_count--;
             }
         } else {
-            // WRITE operation - flag that Amiga modified SD card
-            amiga_wrote_to_card = true;
-            
+            // WRITE operation
             while (1) {
                 while (1) {
                     pins = gpio_get_all();
@@ -178,7 +176,7 @@ static void handle_request() {
                         break;
 
                     if (pins & (1 << PIN_REQ))
-                        return;
+                        return;  // Aborted - flag NOT set
                 }
 
                 spi_get_hw(spi0)->dr = pins & 0xff;
@@ -194,6 +192,8 @@ static void handle_request() {
                 prev_clk = pins & (1 << PIN_CLK);
                 byte_count--;
             }
+            // Write completed successfully - NOW set flag
+            amiga_wrote_to_card = true;
         }
     } else {
         switch ((pins & 0x3e) >> 1) {
