@@ -4,7 +4,7 @@
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
 #include "hardware/pio.h"
-#include "par_amiga_rx.pio.h"
+#include "act_mirror.pio.h"
 #include "pico/cyw43_arch.h"
 #include "lwip/netif.h"
 #include "lwip/ip4_addr.h"
