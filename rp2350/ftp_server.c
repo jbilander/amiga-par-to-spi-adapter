@@ -115,10 +115,6 @@ void ftp_server_main(void) {
     
     printf("Core 1: FTP server ready (placeholder mode)\n");
     
-    // Signal to Core 0 that we're ready
-    core1_done = true;
-    printf("Core 1: Signaled Core 0 that FTP server is ready\n");
-    
     // ========================================================================
     // Main FTP Loop - runs until mode switches back to Amiga
     // ========================================================================

@@ -22,11 +22,11 @@
 
 volatile system_mode_t current_mode = MODE_AMIGA;  // Start in Amiga mode
 volatile led_pattern_t current_led_pattern = LED_AMIGA_MODE;
-volatile bool amiga_wrote_to_card = false;
 volatile bool mode_button_pressed = false;
-volatile bool core1_done = true;  // Core 1 ready initially
 volatile bool card_detect_override = false;  // Override card detect (force "not present")
 
+// Note: spi_mutex only used by FatFS library (diskio.c)
+// No locking needed in main code since only one mode runs at a time
 mutex_t spi_mutex;
 
 // ============================================================================
@@ -265,19 +265,6 @@ void core0_entry(void) {
             }
         }
         
-        // Check for Amiga writes (Core 1 sets this flag in either mode)
-        if (amiga_wrote_to_card && current_mode == MODE_WIFI) {
-            mutex_enter_blocking(&spi_mutex);
-            
-            printf("Core 0: Filesystem changed by Amiga, remounting...\n");
-            // TODO: Remount filesystem
-            // f_unmount("0:");
-            // f_mount(&fs, "0:", 1);
-            amiga_wrote_to_card = false;
-            
-            mutex_exit(&spi_mutex);
-        }
-        
         sleep_ms(50);  // Check every 50ms
     }
 }
@@ -410,8 +397,7 @@ int main() {
     printf("╚═══════════════════════════════════════════╝\n");
     printf("\n");
     
-    // Initialize SPI mutex
-    printf("Core 0: Initializing SPI mutex...\n");
+    // Initialize SPI mutex (used by FatFS library in WiFi mode)
     mutex_init(&spi_mutex);
     
     // Launch Core 1 (will run either Amiga bridge OR FTP server)

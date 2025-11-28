@@ -73,16 +73,16 @@ typedef enum {
 
 extern volatile system_mode_t current_mode;
 extern volatile led_pattern_t current_led_pattern;
-extern volatile bool amiga_wrote_to_card;
 extern volatile bool mode_button_pressed;
-extern volatile bool core1_done;  // Set by Core 1 when fully exited and ready
 extern volatile bool card_detect_override;  // Override card detect to report "not present"
 
 // ============================================================================
 // Synchronization
 // ============================================================================
 
-extern mutex_t spi_mutex;   // SPI bus lock
+// Note: spi_mutex is only used by FatFS library (diskio.c) for SD card access
+// Since only one mode runs at a time after watchdog reset, no actual locking needed in main code
+extern mutex_t spi_mutex;
 
 // ============================================================================
 // Function Declarations

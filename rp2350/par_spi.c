@@ -10,7 +10,6 @@
  * Changes for mode switching:
  * - Uses __wfe() instead of __wfi() with timer alarm
  * - Core 0 sends __sev() to wake Core 1
- * - Uses core1_done flag for synchronization
  * - Supports card_detect_override flag for clean unmounting
  */
 
@@ -186,8 +185,6 @@ static void handle_request() {
                 prev_clk = pins & (1 << PIN_CLK);
                 byte_count--;
             }
-            // Write completed successfully - NOW set flag
-            amiga_wrote_to_card = true;
         }
     } else {
         switch ((pins & 0x3e) >> 1) {
@@ -315,10 +312,6 @@ void par_spi_main(void) {
     printf("Core 1: Exclusive handler installed (fast interrupts ~200-300ns)\n");
     printf("Core 1: Amiga bridge ready\n");
     
-    // Signal to Core 0 that we're ready
-    core1_done = true;
-    printf("Core 1: Signaled Core 0 that Amiga bridge is ready\n");
-
     // Main loop - runs until mode switches back to WiFi
     // Using __wfe() (Wait For Event) which wakes on interrupts OR SEV from Core 0
     while (current_mode == MODE_AMIGA) {
@@ -335,8 +328,6 @@ void par_spi_main(void) {
         }
         
         if (req_triggered) {
-            // === TAKE SPI MUTEX (multicore safety) ===
-            mutex_enter_blocking(&spi_mutex);
             gpio_put(PIN_LED, 1);  // SPI activity LED on (GPIO 28)
             
             // Process the Amiga request
@@ -353,9 +344,7 @@ void par_spi_main(void) {
             if (spi_is_readable(spi0))
                 (void)spi_get_hw(spi0)->dr;
             
-            // === RELEASE SPI MUTEX ===
             gpio_put(PIN_LED, 0);  // SPI activity LED off
-            mutex_exit(&spi_mutex);
         }
     }
 
@@ -380,9 +369,4 @@ void par_spi_main(void) {
     printf("Core 1: SPI deinit skipped (for testing)\n");
     
     printf("Core 1: Cleanup complete\n");
-    
-    // Signal to Core 0 that we're fully done
-    printf("Core 1: DEBUG - About to set core1_done = true\n");
-    core1_done = true;
-    printf("Core 1: Signaled Core 0 that cleanup is done\n");
 }
