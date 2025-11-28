@@ -1,23 +1,17 @@
 /*
- * Interrupts + Sleep (Based on Niklas's October 2022 RP2040 version)
- * Adapted for multicore operation with SPI mutex protection
+ * par_spi.c - Core 1: Amiga SPI Bridge (Amiga Mode Only)
+ * VERSION: 2024-11-28-CARD-FIX
  * 
- * Changes from original:
- * - Added: PIO state machine mirrors REQ → ACT automatically (8-16ns latency)
- * - Removed: All manual gpio_put(PIN_ACT, ...) calls (PIO handles ACT now)
- * - Added: REQ falling edge interrupt wakes CPU from sleep (replaces busy-wait loop)
- * - Added: Card detect interrupt signals Amiga (replaces polling in idle loop)
- * - Added: Card detect debouncing (50ms) to filter mechanical switch bouncing
- * - Added: __wfi() in main loop - CPU sleeps when idle (was 100% busy-wait)
- * - Added: Exclusive interrupt handler for minimum latency (~200-300ns)
- * - Added: SPI mutex protection for multicore safety (core 0 = Amiga, core 1 = FTP)
- * - Added: PIN_LED indicator (high = SPI busy, low = SPI available)
- * - Unchanged: Still busy-waits for CLK edges during transfers (same as original)
+ * Based on jbilander's verified working version
+ * Runs on Core 1 when in MODE_AMIGA
+ * Uses exclusive interrupt handler for fast response (~200-300ns)
+ * PIO1 for ACT mirroring
  * 
- * CPU usage: ~20-30% average (idle: <1%, active: 100%), depends on transfer frequency
- * Power savings: ~80% reduction when idle
- * Card detect: Single clean interrupt per card change (filters bouncing)
- * Multicore: Safe SPI sharing between cores via mutex
+ * Changes for mode switching:
+ * - Uses __wfe() instead of __wfi() with timer alarm
+ * - Core 0 sends __sev() to wake Core 1
+ * - Uses core1_done flag for synchronization
+ * - Supports card_detect_override flag for clean unmounting
  */
 
 #include "main.h"
@@ -213,7 +207,15 @@ static void handle_request() {
                         return;
                 }
 
-                gpio_put(PIN_D(0), !gpio_get(PIN_CDET));
+                // Check override flag first - if set, always report "not present"
+                bool card_present;
+                if (card_detect_override) {
+                    card_present = false;  // Force "not present" during mode switch
+                } else {
+                    card_present = !gpio_get(PIN_CDET);  // Normal: read actual GPIO
+                }
+                
+                gpio_put(PIN_D(0), card_present);
                 gpio_set_dir_out_masked(0xff);
                 break;
             }
@@ -237,7 +239,38 @@ static void handle_request() {
     card_detect_enabled = true;
 }
 
+// ============================================================================
+// Core 1 Entry Point - Work Loop (Amiga OR FTP)
+// ============================================================================
+
+void core1_entry(void) {
+    printf("Core 1: Starting (will switch between Amiga and FTP modes)\n");
+    
+    while (1) {
+        if (current_mode == MODE_AMIGA) {
+            // Amiga mode - run the bridge
+            printf("Core 1: Entering Amiga mode\n");
+            par_spi_main();
+            printf("Core 1: Exited Amiga mode\n");
+        } else if (current_mode == MODE_WIFI) {
+            // WiFi mode - run FTP server
+            printf("Core 1: Entering WiFi/FTP mode\n");
+            ftp_server_main();
+            printf("Core 1: Exited WiFi/FTP mode\n");
+        } else {
+            // MODE_SWITCHING - just wait
+            sleep_ms(100);
+        }
+    }
+}
+
+// ============================================================================
+// Amiga Bridge Main (runs on Core 1 in Amiga mode)
+// ============================================================================
+
 void par_spi_main(void) {
+    printf("Core 1: Initializing Amiga bridge...\n");
+    
     // Initialize SPI
     spi_init(spi0, SPI_SLOW_FREQUENCY);
 
@@ -259,38 +292,52 @@ void par_spi_main(void) {
     gpio_init(PIN_ACT);
     gpio_put(PIN_ACT, 1);
 
-    // === Initialize PIO for ACT mirroring ===
-    PIO pio = pio0;
+    // === Initialize PIO for ACT mirroring (use PIO1, PIO0 used by WiFi) ===
+    PIO pio = pio1;
     uint sm = 0;
     uint offset = pio_add_program(pio, &act_mirror_program);
     act_mirror_program_init(pio, sm, offset, PIN_REQ, PIN_ACT);
 
     prev_cdet = gpio_get_all() & (1 << PIN_CDET);
 
-    // === Setup interrupt handler ===
+    // === Setup exclusive interrupt handler ===
     
     // Enable GPIO interrupts for both REQ and CDET
     gpio_set_irq_enabled(PIN_REQ, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
     gpio_set_irq_enabled(PIN_CDET, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
     
     // Use exclusive handler for maximum speed
-    // (REQ is time-critical, CDET includes debouncing)
     irq_set_exclusive_handler(IO_IRQ_BANK0, gpio_irq_exclusive_handler);
     irq_set_priority(IO_IRQ_BANK0, 0);  // Highest priority
     irq_set_enabled(IO_IRQ_BANK0, true);
 
-    printf("Amiga SPI bridge ready (core 0)\n");
+    printf("Core 1: PIO1 ACT mirroring enabled\n");
+    printf("Core 1: Exclusive handler installed (fast interrupts ~200-300ns)\n");
+    printf("Core 1: Amiga bridge ready\n");
+    
+    // Signal to Core 0 that we're ready
+    core1_done = true;
+    printf("Core 1: Signaled Core 0 that Amiga bridge is ready\n");
 
-    while (1) {
-        // Sleep until REQ interrupt wakes us
+    // Main loop - runs until mode switches back to WiFi
+    // Using __wfe() (Wait For Event) which wakes on interrupts OR SEV from Core 0
+    while (current_mode == MODE_AMIGA) {
         req_triggered = false;
         
-        __wfi();  // Wait For Interrupt - CPU sleeps here!
+        // Wait for interrupt OR event from Core 0
+        // This wakes on: REQ interrupt, card detect interrupt, OR __sev() from Core 0
+        __wfe();
+        
+        // Check if it was a mode change
+        if (current_mode != MODE_AMIGA) {
+            printf("Core 1: DEBUG - Mode changed detected! current_mode=%d\n", current_mode);
+            break;  // Exit cleanly
+        }
         
         if (req_triggered) {
             // === TAKE SPI MUTEX (multicore safety) ===
             mutex_enter_blocking(&spi_mutex);
-            gpio_put(PIN_LED, 1);  // LED on = SPI busy
+            gpio_put(PIN_LED, 1);  // SPI activity LED on (GPIO 28)
             
             // Process the Amiga request
             handle_request();
@@ -307,8 +354,35 @@ void par_spi_main(void) {
                 (void)spi_get_hw(spi0)->dr;
             
             // === RELEASE SPI MUTEX ===
-            gpio_put(PIN_LED, 0);  // LED off = SPI available
+            gpio_put(PIN_LED, 0);  // SPI activity LED off
             mutex_exit(&spi_mutex);
         }
     }
+
+    // Exiting Amiga mode - cleanup
+    printf("Core 1: Cleaning up Amiga bridge...\n");
+    
+    // Disable interrupts
+    gpio_set_irq_enabled(PIN_REQ, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
+    gpio_set_irq_enabled(PIN_CDET, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
+    irq_set_enabled(IO_IRQ_BANK0, false);
+    irq_remove_handler(IO_IRQ_BANK0, gpio_irq_exclusive_handler);
+    
+    // Disable PIO
+    pio_sm_set_enabled(pio, sm, false);
+    pio_remove_program(pio, &act_mirror_program, offset);
+    
+    printf("Core 1: PIO disabled\n");
+    
+    // Deinitialize SPI to avoid conflicts with WiFi
+    // NOTE: Commenting this out for testing - may be causing issues
+    // spi_deinit(spi0);
+    printf("Core 1: SPI deinit skipped (for testing)\n");
+    
+    printf("Core 1: Cleanup complete\n");
+    
+    // Signal to Core 0 that we're fully done
+    printf("Core 1: DEBUG - About to set core1_done = true\n");
+    core1_done = true;
+    printf("Core 1: Signaled Core 0 that cleanup is done\n");
 }
