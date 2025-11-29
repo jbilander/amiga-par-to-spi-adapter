@@ -1,124 +1,77 @@
 #ifndef FREERTOS_CONFIG_H
 #define FREERTOS_CONFIG_H
 
-/* ---------------------------------------------------------------------------
- * Platform Includes (Pico SDK)
- * --------------------------------------------------------------------------- */
-#include "rp2350_device.h"
-#include "core_cm33.h"
-#include "cmsis_gcc.h"
-#include "pico.h"
-#include "hardware/clocks.h"
-//#include "rp2350_device.h"
-//#include "rp2350_irq.h"
-//#include "core_cm33.h"
+/* --------------------------------------------------------------------------
+ * Minimal, safe FreeRTOSConfig for RP2350 (Cortex-M33 non-secure / NTZ)
+ * - Do NOT include Pico SDK headers here (they get included elsewhere).
+ * - Implement vApplicationGetIdleTaskMemory() and vApplicationGetTimerTaskMemory()
+ *   in your application source (main.c). Do NOT prototype them here.
+ * -------------------------------------------------------------------------- */
 
+/* Basic kernel behaviour */
+#define configUSE_PREEMPTION                    1
+#define configUSE_TIME_SLICING                  1
+#define configUSE_16_BIT_TICKS                  0   /* REQUIRED: set to 0 for 32-bit tick */
+#define configCPU_CLOCK_HZ                      ( 150000000UL ) /* fallback; you can override via clock_get_hz(clk_sys) */
+#define configTICK_RATE_HZ                      1000U
+#define configMAX_PRIORITIES                    7
+#define configMINIMAL_STACK_SIZE                256
+#define configTOTAL_HEAP_SIZE                   (64 * 1024)
+#define configMAX_TASK_NAME_LEN                 16
 
+/* Hooks */
+#define configUSE_IDLE_HOOK                     1
+#define configUSE_TICK_HOOK                     1
+#define configUSE_MALLOC_FAILED_HOOK            1
+#define configCHECK_FOR_STACK_OVERFLOW          2
 
-/* ---------------------------------------------------------------------------
- * Cortex-M33 Mandatory Configuration (RP2350 ARM-S core)
- * --------------------------------------------------------------------------- */
+/* Synchronization primitives */
+#define configUSE_MUTEXES                       1
+#define configUSE_RECURSIVE_MUTEXES             1
+#define configUSE_COUNTING_SEMAPHORES           1
+#define configUSE_QUEUE_SETS                    1
 
-/* RP2350 includes hardware FPU */
-#define configENABLE_FPU                1
+/* Timers */
+#define configUSE_TIMERS                        1
+#define configTIMER_TASK_PRIORITY               (configMAX_PRIORITIES - 1)
+#define configTIMER_QUEUE_LENGTH                8
+#define configTIMER_TASK_STACK_DEPTH            (configMINIMAL_STACK_SIZE * 2)
 
-/* Pico SDK runs non-secure only */
-#define configENABLE_TRUSTZONE          0
+/* Allocation support */
+#define configSUPPORT_STATIC_ALLOCATION         1
+#define configSUPPORT_DYNAMIC_ALLOCATION        1
 
-/* RP2350 does not use FreeRTOS MPU */
-#define configENABLE_MPU                0
+/* Cortex-M33 / RP2350 specifics (disabled features) */
+#define configENABLE_MPU                        0
+#define configENABLE_FPU                        0
+#define configENABLE_TRUSTZONE                  0
 
-/* ---------------------------------------------------------------------------
- * Cortex-M33 Interrupt Priority Configuration (REQUIRED)
- * --------------------------------------------------------------------------- */
+/* Priority settings for NVIC / FreeRTOS */
+#define configPRIO_BITS                         3
+#define configLIBRARY_LOWEST_INTERRUPT_PRIORITY 7
+#define configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY 1
 
-/* RP2350 Cortex-M33 implements 3 bits of priority */
-#define configPRIO_BITS                             3
+#define configMAX_SYSCALL_INTERRUPT_PRIORITY    ( configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY << (8 - configPRIO_BITS) )
+#define configKERNEL_INTERRUPT_PRIORITY         ( configLIBRARY_LOWEST_INTERRUPT_PRIORITY << (8 - configPRIO_BITS) )
 
-/* Lowest interrupt priority in the NVIC */
-#define configLIBRARY_LOWEST_INTERRUPT_PRIORITY     7
+/* Optional API functions */
+#define INCLUDE_vTaskPrioritySet                1
+#define INCLUDE_uxTaskPriorityGet               1
+#define INCLUDE_vTaskDelete                     1
+#define INCLUDE_vTaskSuspend                    1
+#define INCLUDE_vTaskDelayUntil                 1
+#define INCLUDE_vTaskDelay                      1
+#define INCLUDE_xSemaphoreGetMutexHolder        1  /* required by pico async_context_freertos */
 
-/* Highest priority from which FreeRTOS API can be called */
-#define configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY 5
+/* Helper macro expected by Pico's async_context_freertos */
+#define portCHECK_IF_IN_ISR() (__get_IPSR() != 0)
 
-/* Derived FreeRTOS priority values */
-#define configKERNEL_INTERRUPT_PRIORITY \
-    (configLIBRARY_LOWEST_INTERRUPT_PRIORITY << (8 - configPRIO_BITS))
+/* Assertion handling: declare vAssertCalled here (implement it in main.c) */
+extern void vAssertCalled(const char *file, int line);
+#define configASSERT(x) if ((x) == 0) vAssertCalled(__FILE__, __LINE__)
 
-#define configMAX_SYSCALL_INTERRUPT_PRIORITY \
-    (configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY << (8 - configPRIO_BITS))
-
-/* ---------------------------------------------------------------------------
- * Kernel Basics
- * --------------------------------------------------------------------------- */
-
-#define configUSE_PREEMPTION            1
-#define configUSE_IDLE_HOOK             0
-#define configUSE_TICK_HOOK             0
-
-#define configCPU_CLOCK_HZ              ( clock_get_hz(clk_sys) )
-#define configTICK_RATE_HZ              ( 1000U )
-
-#define configMAX_PRIORITIES            7
-#define configMINIMAL_STACK_SIZE        256
-#define configTOTAL_HEAP_SIZE           (32 * 1024)
-#define configMAX_TASK_NAME_LEN         16
-
-#define configUSE_16_BIT_TICKS          0
-
-/* ---------------------------------------------------------------------------
- * Memory Allocation / Hooks
- * --------------------------------------------------------------------------- */
-#define configCHECK_FOR_STACK_OVERFLOW  0
-#define configUSE_MALLOC_FAILED_HOOK    0
-
-/* ---------------------------------------------------------------------------
- * Synchronization Objects
- * --------------------------------------------------------------------------- */
-#define configUSE_MUTEXES               1
-#define configUSE_RECURSIVE_MUTEXES     1
-#define configUSE_COUNTING_SEMAPHORES   1
-#define configUSE_QUEUE_SETS            1
-
-/* ---------------------------------------------------------------------------
- * Software Timers
- * --------------------------------------------------------------------------- */
-#define configUSE_TIMERS                1
-#define configTIMER_TASK_PRIORITY       (configMAX_PRIORITIES - 1)
-#define configTIMER_TASK_STACK_DEPTH    512
-#define configTIMER_QUEUE_LENGTH        10
-
-/* ---------------------------------------------------------------------------
- * Multicore Handling
- * --------------------------------------------------------------------------- */
-#define configNUM_CORES                 1
-
-/* ---------------------------------------------------------------------------
- * API Inclusions (required by Pico async_context_freertos)
- * --------------------------------------------------------------------------- */
-#define INCLUDE_vTaskPrioritySet        1
-#define INCLUDE_uxTaskPriorityGet       1
-#define INCLUDE_vTaskDelete             1
-#define INCLUDE_vTaskSuspend            1
-#define INCLUDE_vTaskDelayUntil         1
-#define INCLUDE_vTaskDelay              1
-#define INCLUDE_xSemaphoreGetMutexHolder 1
-
-/* ---------------------------------------------------------------------------
- * lwIP Compatibility
- * --------------------------------------------------------------------------- */
-#define portTICK_RATE_MS                portTICK_PERIOD_MS
-
-/* ---------------------------------------------------------------------------
- * ISR Detection (required by pico_async_context_freertos)
- * --------------------------------------------------------------------------- */
-#define portCHECK_IF_IN_ISR()           (__get_IPSR() != 0)
-
-/* ---------------------------------------------------------------------------
- * Diagnostics / Debug
- * --------------------------------------------------------------------------- */
-#define configASSERT(x) if((x)==0) { taskDISABLE_INTERRUPTS(); for( ;; ); }
-#define configQUEUE_REGISTRY_SIZE       8
-#define configUSE_PORT_OPTIMISED_TASK_SELECTION 1
+/* Trace / stats (optional) */
+#define configGENERATE_RUN_TIME_STATS           0
+#define configUSE_TRACE_FACILITY                0
 
 #endif /* FREERTOS_CONFIG_H */
