@@ -1,443 +1,419 @@
-/* main.c - Core 0: WiFi management and mode switching */
+/* main.c - Pico 2 W Amiga SPI Bridge with WiFi/FTP Mode Switching
+ * VERSION: 2024-11-29-FREERTOS
+ * 
+ * Hardware: Raspberry Pi Pico 2 W (RP2350)
+ * 
+ * Two Modes (via watchdog reset):
+ * - MODE_AMIGA: Core 1 runs Amiga SPI bridge (par_spi.c) - strict timing, no FreeRTOS
+ * - MODE_WIFI:  Core 1 runs FTP server with FreeRTOS - socket API enabled
+ * 
+ * Mode switch: GPIO 13 button (50ms debounce)
+ * 
+ * Based on Niklas Ekström's October 2022 RP2040 version
+ * Adapted for Pico 2 W by jbilander
+ */
 
 #include "main.h"
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
-#include "pico/cyw43_arch.h"
-#include "pico/time.h"
-#include "hardware/gpio.h"
+#include "pico/mutex.h"
 #include "hardware/watchdog.h"
-#include "lwip/netif.h"
+#include "hardware/gpio.h"
+#include "pico/cyw43_arch.h"
+#include <stdio.h>
+#include <string.h>
+
+// FreeRTOS includes (only used in WiFi mode)
+#include "FreeRTOS.h"
+#include "task.h"
+
+// FTP Server
+#include "ftp_server.h"
+#include "ff.h"
 
 // ============================================================================
-// Boot Mode Magic Values (stored in watchdog scratch registers)
+// Global Variables
 // ============================================================================
 
-#define BOOT_MODE_WIFI_MAGIC  0x57494649  // "WIFI" in ASCII
-#define BOOT_MODE_AMIGA_MAGIC 0x414D4947  // "AMIG" in ASCII
-
-// ============================================================================
-// Shared State Variables
-// ============================================================================
-
-volatile system_mode_t current_mode = MODE_AMIGA;  // Start in Amiga mode
-volatile led_pattern_t current_led_pattern = LED_AMIGA_MODE;
-volatile bool mode_button_pressed = false;
-volatile bool card_detect_override = false;  // Override card detect (force "not present")
-
-// Note: spi_mutex only used by FatFS library (diskio.c)
-// No locking needed in main code since only one mode runs at a time
+// SPI Mutex (for FatFS library dependency)
 mutex_t spi_mutex;
 
-// ============================================================================
-// Mode Toggle Button (GPIO 13) with Debouncing
-// ============================================================================
+// Current operating mode (set at boot from watchdog scratch register)
+volatile system_mode_t current_mode = MODE_AMIGA;
 
-bool button_timer_callback(struct repeating_timer *t) {
-    static bool initialized = false;
-    static bool last_state = true;  // Default to high (pulled up)
-    static uint32_t last_change_time = 0;
-    
-    bool current_state = gpio_get(PIN_MODE_SW);  // Active low (pulled up)
-    uint32_t now = to_ms_since_boot(get_absolute_time());
-    
-    // On first call, initialize last_state from actual GPIO
-    if (!initialized) {
-        last_state = current_state;
-        initialized = true;
-        return true;  // Continue timer
-    }
-    
-    // Detect state change
-    if (current_state != last_state) {
-        // Check if enough time has passed since last change (debounce)
-        if ((now - last_change_time) >= BUTTON_DEBOUNCE_MS) {
-            // Valid state change - update timestamp
-            last_change_time = now;
-            
-            // Trigger on button press (falling edge - goes LOW)
-            if (!current_state && last_state) {
-                mode_button_pressed = true;
-            }
-            
-            last_state = current_state;
-        }
-        // If not enough time passed, ignore (still bouncing)
-    }
-    
-    return true;  // Keep timer running
-}
+// Card detect override flag (used in Amiga mode to prevent corruption during mode switch)
+volatile bool card_detect_override = false;
 
 // ============================================================================
-// LED Update Timer Callback
+// Watchdog Magic Values (stored in scratch registers across reset)
 // ============================================================================
 
-bool led_update_timer_callback(struct repeating_timer *t) {
-    update_led_pattern();
-    return true;  // Keep timer running
-}
+#define BOOT_MODE_AMIGA_MAGIC   0xA3165A00
+#define BOOT_MODE_WIFI_MAGIC    0xF1F00000
 
 // ============================================================================
-// LED Pattern Update (using CYW43_WL_GPIO_LED_PIN)
+// Version String
 // ============================================================================
 
-void update_led_pattern(void) {
-    // Only update LED if in WiFi mode (CYW43 initialized)
-    if (current_mode != MODE_WIFI && current_mode != MODE_SWITCHING) {
-        return;  // Amiga mode - CYW43 not initialized, skip LED updates
-    }
-    
-    static uint32_t last_toggle = 0;
-    static bool led_state = false;
-    uint32_t now = time_us_32();
-    
-    switch (current_led_pattern) {
-        case LED_STARTUP:
-            // Solid ON
-            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-            break;
-            
-        case LED_WIFI_CONNECTING:
-            // Fast blink
-            if (now - last_toggle > (LED_WIFI_CONNECTING_MS * 1000)) {
-                led_state = !led_state;
-                cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_state);
-                last_toggle = now;
-            }
-            break;
-            
-        case LED_WIFI_CONNECTED:
-            // Slow blink
-            if (now - last_toggle > (LED_WIFI_CONNECTED_MS * 1000)) {
-                led_state = !led_state;
-                cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_state);
-                last_toggle = now;
-            }
-            break;
-            
-        case LED_WIFI_FAILED:
-            // Very fast blink
-            if (now - last_toggle > (LED_WIFI_FAILED_MS * 1000)) {
-                led_state = !led_state;
-                cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_state);
-                last_toggle = now;
-            }
-            break;
-            
-        case LED_AMIGA_MODE:
-            // OFF (but we shouldn't get here in Amiga mode)
-            break;
-            
-        case LED_MODE_SWITCHING:
-            // Handled separately
-            break;
-    }
-}
+#define VERSION_STRING "2024-11-29-FREERTOS"
 
 // ============================================================================
-// Mode Switch Visual Feedback
+// GPIO Button Debouncing
 // ============================================================================
 
-void indicate_mode_switch(void) {
-    // Only flash LED if CYW43 is initialized (switching FROM WiFi mode)
-    // If switching FROM Amiga mode, CYW43 not initialized yet - skip LED flashes
-    if (current_mode == MODE_WIFI) {
-        for (int i = 0; i < LED_MODE_SWITCH_COUNT; i++) {
-            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-            sleep_ms(LED_MODE_SWITCH_FLASH_MS);
-            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
-            sleep_ms(LED_MODE_SWITCH_FLASH_MS);
-        }
+#define BUTTON_DEBOUNCE_MS 50
+
+static uint32_t last_button_press = 0;
+
+// ============================================================================
+// Core 1 Entry Point (launched from main)
+// ============================================================================
+
+void core1_entry(void) {
+    if (current_mode == MODE_AMIGA) {
+        // Amiga mode: Run SPI bridge with exclusive IRQ handling
+        // NO FreeRTOS - strict timing preserved (~200-300ns response)
+        par_spi_main();
     } else {
-        // Amiga mode - CYW43 not initialized, just delay
-        printf("Core 0: Mode switching (LED not available in Amiga mode)\n");
-        sleep_ms(LED_MODE_SWITCH_FLASH_MS * LED_MODE_SWITCH_COUNT * 2);
+        // WiFi mode: Run FTP server with FreeRTOS
+        // FreeRTOS scheduler starts here (vTaskStartScheduler)
+        ftp_server_main();
     }
 }
 
 // ============================================================================
-// Card Detection Signaling
-// ============================================================================
-
-void signal_card_change(void) {
-    // Pulse IRQ to notify Amiga of card status change
-    // Amiga will check card detect line to determine current state
-    gpio_put(PIN_IRQ, false);
-    gpio_set_dir(PIN_IRQ, true);   // Drive low
-    busy_wait_us(10);               // 10μs pulse
-    gpio_set_dir(PIN_IRQ, false);  // Back to input (pulled up externally)
-}
-
-// ============================================================================
-// Mode Switching Functions (called from Core 0)
+// Mode Switching Functions
 // ============================================================================
 
 void switch_to_amiga_mode(void) {
-    printf("\n=================================\n");
-    printf("Switching to Amiga mode...\n");
-    printf("=================================\n");
+    printf("\n=== Switching to Amiga Mode ===\n");
     
-    indicate_mode_switch();
+    if (current_mode == MODE_WIFI) {
+        // Disconnect WiFi cleanly
+        printf("Disconnecting WiFi...\n");
+        cyw43_arch_deinit();
+    }
     
-    // Signal card change to Amiga (card removal)
-    printf("Core 0: Signaling card removal to Amiga\n");
-    signal_card_change();
-    sleep_ms(100);
+    // Set card detect override to prevent Amiga from accessing card during reboot
+    card_detect_override = true;
+    printf("Card detect override: ENABLED (Amiga will see card as NOT PRESENT)\n");
     
-    // Save desired mode to watchdog scratch register
-    printf("Core 0: Saving Amiga mode preference\n");
-    watchdog_hw->scratch[0] = BOOT_MODE_AMIGA_MAGIC;
+    // Send multiple IRQ pulses to ensure Amiga unmounts
+    printf("Sending IRQ pulses to Amiga to force unmount...\n");
+    for (int i = 0; i < 5; i++) {
+        gpio_put(PIN_IRQ, 0);
+        sleep_ms(100);
+        gpio_put(PIN_IRQ, 1);
+        sleep_ms(100);
+    }
     
-    // Give time for message to print
+    printf("Waiting for Amiga to unmount...\n");
     sleep_ms(500);
     
-    // Reboot the Pico
-    printf("Core 0: Rebooting to Amiga mode...\n");
-    sleep_ms(100);  // Let message print
+    // Store magic value in watchdog scratch register
+    watchdog_hw->scratch[0] = BOOT_MODE_AMIGA_MAGIC;
+    printf("Watchdog scratch set: AMIGA mode\n");
     
-    watchdog_reboot(0, 0, 100);  // Reboot in 100ms
-    while(1) {
-        tight_loop_contents();  // Wait for reboot
+    // Trigger watchdog reset
+    printf("Triggering watchdog reset...\n");
+    watchdog_reboot(0, 0, 10);
+    
+    // Wait for reset (should not return)
+    while (1) {
+        tight_loop_contents();
     }
 }
 
 void switch_to_wifi_mode(void) {
-    printf("\n=================================\n");
-    printf("Switching to WiFi mode...\n");
-    printf("=================================\n");
+    printf("\n=== Switching to WiFi Mode ===\n");
     
-    indicate_mode_switch();
-    
-    // Override card detect to report "not present" even if card is physically there
+    // Set card detect override to prevent Amiga from accessing card during reboot
     card_detect_override = true;
-    printf("Core 0: Card detect override enabled (will report 'not present')\n");
+    printf("Card detect override: ENABLED (Amiga will see card as NOT PRESENT)\n");
     
-    // Signal card change to Amiga (card removal)
-    printf("Core 0: Signaling card removal to Amiga\n");
-    signal_card_change();
-    sleep_ms(100);
-    
-    // Pulse IRQ a few more times to ensure Amiga sees it
-    printf("Core 0: Sending additional card removal pulses...\n");
-    for (int i = 0; i < 3; i++) {
-        signal_card_change();
-        sleep_ms(50);
+    // Send multiple IRQ pulses to ensure Amiga unmounts
+    printf("Sending IRQ pulses to Amiga to force unmount...\n");
+    for (int i = 0; i < 5; i++) {
+        gpio_put(PIN_IRQ, 0);
+        sleep_ms(100);
+        gpio_put(PIN_IRQ, 1);
+        sleep_ms(100);
     }
     
-    // Save desired mode to watchdog scratch register
-    printf("Core 0: Saving WiFi mode preference\n");
-    watchdog_hw->scratch[0] = BOOT_MODE_WIFI_MAGIC;
-    
-    // Give time for Amiga to process card removal
+    printf("Waiting for Amiga to unmount...\n");
     sleep_ms(500);
     
-    // Reboot the Pico
-    printf("Core 0: Rebooting to WiFi mode...\n");
-    sleep_ms(100);  // Let message print
+    // Store magic value in watchdog scratch register
+    watchdog_hw->scratch[0] = BOOT_MODE_WIFI_MAGIC;
+    printf("Watchdog scratch set: WIFI mode\n");
     
-    watchdog_reboot(0, 0, 100);  // Reboot in 100ms
-    while(1) {
-        tight_loop_contents();  // Wait for reboot
+    // Trigger watchdog reset
+    printf("Triggering watchdog reset...\n");
+    watchdog_reboot(0, 0, 10);
+    
+    // Wait for reset (should not return)
+    while (1) {
+        tight_loop_contents();
     }
 }
 
 // ============================================================================
-// Mode button indicator (LED flashes)
-// ============================================================================
-    
-
-// ============================================================================
-// Core 0 Entry Point - Mode Management
+// Button Handler (Core 0 - Mode Manager)
 // ============================================================================
 
-void core0_entry(void) {
-    printf("Core 0: Mode manager ready\n");
+static void handle_button_press(void) {
+    uint32_t now = to_ms_since_boot(get_absolute_time());
     
+    // Debounce
+    if (now - last_button_press < BUTTON_DEBOUNCE_MS) {
+        return;
+    }
+    last_button_press = now;
+    
+    // Read button state
+    bool button_pressed = !gpio_get(PIN_MODE_SW);  // Active low (internal pull-up)
+    
+    if (!button_pressed) {
+        return;  // Button not pressed
+    }
+    
+    printf("\nButton pressed! Switching mode...\n");
+    
+    if (current_mode == MODE_AMIGA) {
+        switch_to_wifi_mode();
+    } else {
+        switch_to_amiga_mode();
+    }
+}
+
+// ============================================================================
+// Core 0: Mode Manager (runs in both modes)
+// ============================================================================
+
+static void core0_mode_manager(void) {
+    printf("Core 0: Mode manager starting...\n");
+    
+    // Main loop - monitor button
     while (1) {
-        // Handle mode button press
-        if (mode_button_pressed) {
-            mode_button_pressed = false;
-            
-            if (current_mode == MODE_AMIGA) {
-                switch_to_wifi_mode();
-            } else if (current_mode == MODE_WIFI) {
-                switch_to_amiga_mode();
-            }
+        handle_button_press();
+        
+        if (current_mode == MODE_AMIGA) {
+            // Amiga mode - just sleep (LED on GPIO 28 handled by par_spi.c)
+            sleep_ms(1000);
+        } else {
+            // WiFi mode - blink WiFi LED
+            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+            sleep_ms(100);
+            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+            sleep_ms(100);
+        }
+    }
+}
+
+// ============================================================================
+// WiFi Connection (Core 0 - WiFi Mode Only)
+// ============================================================================
+
+static bool connect_wifi(void) {
+    printf("Connecting to WiFi (SSID: %s)...\n", WIFI_SSID);
+    
+    if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD, 
+                                            CYW43_AUTH_WPA2_AES_PSK, 30000)) {
+        printf("ERROR: Failed to connect to WiFi\n");
+        return false;
+    }
+    
+    printf("WiFi connected!\n");
+    printf("IP Address: %s\n", ip4addr_ntoa(netif_ip4_addr(netif_list)));
+    
+    return true;
+}
+
+// ============================================================================
+// FTP Server Main (Core 1 - WiFi Mode Only)
+// ============================================================================
+
+// FTP server instance
+static ftp_server_t ftp_server;
+static FATFS fs;
+
+// FTP task (runs as FreeRTOS task)
+static void ftp_task(__unused void *params) {
+    printf("FTP Task: Starting FTP server...\n");
+    
+    // Mount SD card filesystem
+    printf("FTP Task: Mounting SD card filesystem...\n");
+    FRESULT fr = f_mount(&fs, "", 1);
+    
+    if (fr != FR_OK) {
+        printf("FTP Task: ERROR - Failed to mount SD card (FR=%d)\n", fr);
+        printf("FTP Task: FTP server cannot start without SD card\n");
+        
+        // Flash LED fast to indicate error
+        while (current_mode == MODE_WIFI) {
+            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
         
-        sleep_ms(50);  // Check every 50ms
+        f_mount(NULL, "", 0);
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    printf("FTP Task: SD card mounted successfully\n");
+    
+    // Initialize FTP server
+    if (!ftp_server_init(&ftp_server, &fs)) {
+        printf("FTP Task: ERROR - Failed to initialize FTP server\n");
+        f_mount(NULL, "", 0);
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    // Add users
+    ftp_server_add_user(&ftp_server, "amiga", "amiga");
+    ftp_server_add_user(&ftp_server, "admin", "admin");
+    
+    // Start FTP server
+    if (!ftp_server_begin(&ftp_server)) {
+        printf("FTP Task: ERROR - Failed to start FTP server\n");
+        f_mount(NULL, "", 0);
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    printf("FTP Task: FTP server ready on port 21\n");
+    printf("FTP Task: Users: amiga/amiga, admin/admin\n");
+    
+    // Main FTP Loop (runs forever as FreeRTOS task)
+    while (current_mode == MODE_WIFI) {
+        ftp_server_handle(&ftp_server);
+        
+        // Yield to other tasks
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    
+    // Cleanup when exiting WiFi mode (mode switch detected)
+    printf("FTP Task: Cleaning up FTP server...\n");
+    ftp_server_stop(&ftp_server);
+    
+    printf("FTP Task: Unmounting SD card...\n");
+    f_mount(NULL, "", 0);
+    
+    printf("FTP Task: FTP task ending\n");
+    vTaskDelete(NULL);
+}
+
+void ftp_server_main(void) {
+    printf("Core 1: Initializing WiFi mode with FreeRTOS...\n");
+    
+    // CRITICAL: FreeRTOS is ONLY initialized here, in WiFi mode!
+    // When in Amiga mode, par_spi_main() runs instead with no FreeRTOS.
+    
+    printf("Core 1: Creating FTP server task...\n");
+    
+    // Create FTP server task
+    xTaskCreate(
+        ftp_task,           // Task function
+        "FTP_Server",       // Task name
+        2048,              // Stack size (words)
+        NULL,              // Parameters
+        1,                 // Priority
+        NULL               // Task handle
+    );
+    
+    printf("Core 1: Starting FreeRTOS scheduler (WiFi mode only)...\n");
+    
+    // Start FreeRTOS scheduler - THIS NEVER RETURNS!
+    // The scheduler will run the FTP task and handle lwIP
+    vTaskStartScheduler();
+    
+    // Should never reach here
+    printf("Core 1: ERROR - FreeRTOS scheduler returned!\n");
+    while (1) {
+        tight_loop_contents();
     }
 }
 
 // ============================================================================
-// Main - Initialize WiFi on Core 0, Launch Cores
+// Main Entry Point
 // ============================================================================
 
 int main() {
+    // Initialize stdio
     stdio_init_all();
-    
-    // VERSION IDENTIFIER
-    printf("\n╔════════════════════════════════════════════════════════════╗\n");
-    printf("║  Pico 2 W Amiga Bridge - VERSION: 2024-11-28-CARD-FIX   ║\n");
-    printf("╚════════════════════════════════════════════════════════════╝\n\n");
-    
-    // ========================================================================
-    // Check if we're rebooting for mode switch
-    // ========================================================================
-    
-    uint32_t boot_mode = watchdog_hw->scratch[0];
-    watchdog_hw->scratch[0] = 0;  // Clear the flag
-    
-    if (boot_mode == BOOT_MODE_WIFI_MAGIC) {
-        printf("Boot: Mode switch detected → Starting in WiFi mode\n");
-        current_mode = MODE_WIFI;
-        current_led_pattern = LED_WIFI_CONNECTING;
-        card_detect_override = false;  // Clear override (not in Amiga mode)
-    } else if (boot_mode == BOOT_MODE_AMIGA_MAGIC) {
-        printf("Boot: Mode switch detected → Starting in Amiga mode\n");
-        current_mode = MODE_AMIGA;
-        current_led_pattern = LED_AMIGA_MODE;
-        card_detect_override = false;  // Clear override (normal card detection)
-    } else {
-        // Default mode (fresh boot)
-        printf("Boot: Fresh boot → Starting in Amiga mode (default)\n");
-        current_mode = MODE_AMIGA;
-        current_led_pattern = LED_AMIGA_MODE;
-        card_detect_override = false;  // Clear override (normal card detection)
-    }
-    
-    // Initialize SPI activity LED (GPIO 28)
-    gpio_init(PIN_LED);
-    gpio_set_dir(PIN_LED, GPIO_OUT);
-    gpio_put(PIN_LED, 0);
-    
-    sleep_ms(3000);  // USB enumeration
-    
-    printf("\n");
-    printf("╔═══════════════════════════════════════════╗\n");
-    printf("║   Pico 2 W Amiga SPI Bridge v2.0         ║\n");
-    printf("║   Watchdog Reset Mode Switching          ║\n");
-    printf("╚═══════════════════════════════════════════╝\n");
-    printf("\n");
-    
-    // ========================================================================
-    // Initialize WiFi if starting in WiFi mode
-    // ========================================================================
-    
-    if (current_mode == MODE_WIFI) {
-        printf("Core 0: Starting WiFi initialization...\n");
-        
-        if (cyw43_arch_init()) {
-            printf("Core 0: WiFi init failed! Falling back to Amiga mode\n");
-            current_mode = MODE_AMIGA;
-            current_led_pattern = LED_AMIGA_MODE;
-        } else {
-            cyw43_arch_enable_sta_mode();
-            printf("Core 0: Connecting to %s...\n", WIFI_SSID);
-            
-            if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD,
-                                                   CYW43_AUTH_WPA2_AES_PSK, 30000)) {
-                printf("Core 0: Connection failed\n");
-                current_led_pattern = LED_WIFI_FAILED;
-            } else {
-                printf("Core 0: Connected!\n");
-                struct netif *netif = &cyw43_state.netif[CYW43_ITF_STA];
-                printf("Core 0: IP address: %s\n", ip4addr_ntoa(netif_ip4_addr(netif)));
-                current_led_pattern = LED_WIFI_CONNECTED;
-            }
-        }
-    } else {
-        printf("Core 0: Amiga mode - WiFi OFF (CYW43 not initialized)\n");
-    }
-    
-    // Display current mode
-    printf("\n");
-    if (current_mode == MODE_AMIGA) {
-        printf("Core 0: AMIGA MODE active\n");
-        printf("Core 0: Press GPIO 13 button to switch to WiFi\n");
-    } else {
-        printf("Core 0: WIFI MODE active\n");
-        printf("Core 0: Press GPIO 13 button to switch to Amiga\n");
-    }
-    
-    // Setup LED update timer
-    static repeating_timer_t led_timer;
-    add_repeating_timer_ms(50, led_update_timer_callback, NULL, &led_timer);
-    
-    // Setup mode toggle button (GPIO 13)
-    gpio_init(PIN_MODE_SW);
-    gpio_set_dir(PIN_MODE_SW, GPIO_IN);
-    gpio_pull_up(PIN_MODE_SW);  // Pull-up, button connects to ground
-    
-    // Wait for GPIO to settle
-    sleep_ms(100);
-    
-    // Initialize button state - read actual GPIO state
-    // This prevents false trigger on startup
-    mode_button_pressed = false;
-    
-    // Start button polling timer
-    static repeating_timer_t button_timer;
-    add_repeating_timer_ms(50, button_timer_callback, NULL, &button_timer);
-    
-    printf("\n");
-    printf("╔═══════════════════════════════════════════╗\n");
-    printf("║          LED Status Indicators           ║\n");
-    printf("╠═══════════════════════════════════════════╣\n");
-    printf("║  WiFi LED (built-in):                    ║\n");
-    printf("║    Not initialized in Amiga mode         ║\n");
-    printf("║    Slow blink  = WiFi mode (FTP ready)   ║\n");
-    printf("║    Fast blink  = WiFi connecting         ║\n");
-    printf("║    6 flashes   = Mode switching (WiFi)   ║\n");
-    printf("║                                           ║\n");
-    printf("║  SPI LED (GPIO 28):                      ║\n");
-    printf("║    Shows Amiga SPI activity              ║\n");
-    printf("╠═══════════════════════════════════════════╣\n");
-    printf("║  Press button (GPIO 13) to toggle modes  ║\n");
-    printf("╚═══════════════════════════════════════════╝\n");
-    printf("\n");
-    
-    // Initialize SPI mutex (used by FatFS library in WiFi mode)
+    sleep_ms(2000);  // Wait for USB serial
+
+    // Initialize SPI mutex (for FatFS)
     mutex_init(&spi_mutex);
     
-    // Launch Core 1 (will run either Amiga bridge OR FTP server)
-    printf("Core 0: Launching Core 1 (Amiga/FTP worker)...\n");
-    multicore_launch_core1(core1_entry);
-    sleep_ms(200);
+    printf("\n\n");
+    printf("============================================================\n");
+    printf("  Pico 2 W - Amiga SPI Bridge / WiFi FTP Server\n");
+    printf("  VERSION: %s\n", VERSION_STRING);
+    printf("============================================================\n");
     
-    // If starting in Amiga mode (after mode switch), signal card insertion
-    if (current_mode == MODE_AMIGA && boot_mode == BOOT_MODE_AMIGA_MAGIC) {
-        printf("Core 0: Signaling card insertion to Amiga...\n");
-        sleep_ms(500);  // Give Amiga bridge time to fully initialize
-        signal_card_change();
-        sleep_ms(100);
-        // Send a few more pulses to ensure Amiga sees it
-        for (int i = 0; i < 2; i++) {
-            signal_card_change();
-            sleep_ms(50);
-        }
-        printf("Core 0: Card insertion signaled\n");
-    }
+    // Check watchdog scratch register to determine boot mode
+    uint32_t mode_magic = watchdog_hw->scratch[0];
     
-    // Display mode-specific startup message
-    printf("\n");
-    printf("═══════════════════════════════════════════\n");
-    if (current_mode == MODE_AMIGA) {
-        printf(" System Ready - Amiga Mode Active\n");
-        printf(" Core 0: Mode management\n");
-        printf(" Core 1: Amiga bridge\n");
-        printf(" Press GPIO 13 button to enable WiFi\n");
+    if (mode_magic == BOOT_MODE_WIFI_MAGIC) {
+        current_mode = MODE_WIFI;
+        printf("Boot mode: WiFi (from watchdog scratch register)\n");
     } else {
-        printf(" System Ready - WiFi Mode Active\n");
-        printf(" Core 0: WiFi management\n");
-        printf(" Core 1: FTP server\n");
-        printf(" Press GPIO 13 button to switch to Amiga\n");
+        current_mode = MODE_AMIGA;
+        printf("Boot mode: Amiga (default or from watchdog scratch register)\n");
     }
-    printf("═══════════════════════════════════════════\n");
-    printf("\n");
     
-    // Run mode manager on Core 0
-    core0_entry();  // Never returns
+    // Clear watchdog scratch register
+    watchdog_hw->scratch[0] = 0;
     
+    // Initialize GPIO button (internal pull-up, active low)
+    printf("Initializing GPIO %d button...\n", PIN_MODE_SW);
+    gpio_init(PIN_MODE_SW);
+    gpio_set_dir(PIN_MODE_SW, GPIO_IN);
+    gpio_pull_up(PIN_MODE_SW);
+    
+    // Mode-specific initialization
+    if (current_mode == MODE_WIFI) {
+        printf("\n=== WiFi Mode ===\n");
+        
+        // Initialize WiFi chip (ONLY in WiFi mode - requires FreeRTOS)
+        printf("Initializing WiFi chip...\n");
+        if (cyw43_arch_init()) {
+            printf("ERROR: Failed to initialize WiFi chip\n");
+            return 1;
+        }
+        
+        // Connect to WiFi
+        if (!connect_wifi()) {
+            printf("ERROR: WiFi connection failed, cannot start FTP server\n");
+            // Flash LED rapidly to indicate error
+            while (1) {
+                cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+                sleep_ms(100);
+                cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+                sleep_ms(100);
+            }
+        }
+        
+        printf("\nCore 0: WiFi mode manager starting...\n");
+        printf("Press GPIO %d button to switch to Amiga mode\n\n", PIN_MODE_SW);
+        
+    } else {
+        printf("\n=== Amiga Mode ===\n");
+        printf("Core 0: Amiga mode manager starting...\n");
+        printf("Press GPIO %d button to switch to WiFi mode\n\n", PIN_MODE_SW);
+    }
+    
+    // Launch Core 1
+    printf("Launching Core 1...\n");
+    multicore_launch_core1(core1_entry);
+    
+    // Core 0 continues with mode manager
+    core0_mode_manager();
+    
+    // Should never reach here
     return 0;
 }

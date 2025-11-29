@@ -1,6 +1,6 @@
 /*
  * par_spi.c - Core 1: Amiga SPI Bridge (Amiga Mode Only)
- * VERSION: 2024-11-28-CARD-FIX
+ * VERSION: 2024-11-29-FREERTOS
  * 
  * Originally based on Niklas Ekström's October 2022 RP2040 version
  * Adapted for jbilander's Pico 2 W hardware
@@ -9,9 +9,8 @@
  * Uses exclusive interrupt handler for fast response (~200-300ns)
  * PIO1 for ACT mirroring
  * 
- * Changes for mode switching:
- * - Uses __wfe() instead of __wfi() with timer alarm
- * - Core 0 sends __sev() to wake Core 1
+ * Changes for watchdog reset architecture:
+ * - No core1_entry() - called directly by main.c's core1_entry()
  * - Supports card_detect_override flag for clean unmounting
  */
 
@@ -239,32 +238,8 @@ static void handle_request() {
 }
 
 // ============================================================================
-// Core 1 Entry Point - Work Loop (Amiga OR FTP)
-// ============================================================================
-
-void core1_entry(void) {
-    printf("Core 1: Starting (will switch between Amiga and FTP modes)\n");
-    
-    while (1) {
-        if (current_mode == MODE_AMIGA) {
-            // Amiga mode - run the bridge
-            printf("Core 1: Entering Amiga mode\n");
-            par_spi_main();
-            printf("Core 1: Exited Amiga mode\n");
-        } else if (current_mode == MODE_WIFI) {
-            // WiFi mode - run FTP server
-            printf("Core 1: Entering WiFi/FTP mode\n");
-            ftp_server_main();
-            printf("Core 1: Exited WiFi/FTP mode\n");
-        } else {
-            // MODE_SWITCHING - just wait
-            sleep_ms(100);
-        }
-    }
-}
-
-// ============================================================================
 // Amiga Bridge Main (runs on Core 1 in Amiga mode)
+// Called by main.c's core1_entry() when current_mode == MODE_AMIGA
 // ============================================================================
 
 void par_spi_main(void) {
@@ -314,20 +289,14 @@ void par_spi_main(void) {
     printf("Core 1: Exclusive handler installed (fast interrupts ~200-300ns)\n");
     printf("Core 1: Amiga bridge ready\n");
     
-    // Main loop - runs until mode switches back to WiFi
-    // Using __wfe() (Wait For Event) which wakes on interrupts OR SEV from Core 0
-    while (current_mode == MODE_AMIGA) {
+    // Main loop - runs forever in Amiga mode
+    // (Watchdog reset is only way to exit)
+    while (1) {
         req_triggered = false;
         
-        // Wait for interrupt OR event from Core 0
-        // This wakes on: REQ interrupt, card detect interrupt, OR __sev() from Core 0
+        // Wait for interrupt
+        // This wakes on: REQ interrupt or card detect interrupt
         __wfe();
-        
-        // Check if it was a mode change
-        if (current_mode != MODE_AMIGA) {
-            printf("Core 1: DEBUG - Mode changed detected! current_mode=%d\n", current_mode);
-            break;  // Exit cleanly
-        }
         
         if (req_triggered) {
             gpio_put(PIN_LED, 1);  // SPI activity LED on (GPIO 28)
@@ -349,26 +318,7 @@ void par_spi_main(void) {
             gpio_put(PIN_LED, 0);  // SPI activity LED off
         }
     }
-
-    // Exiting Amiga mode - cleanup
-    printf("Core 1: Cleaning up Amiga bridge...\n");
     
-    // Disable interrupts
-    gpio_set_irq_enabled(PIN_REQ, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
-    gpio_set_irq_enabled(PIN_CDET, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
-    irq_set_enabled(IO_IRQ_BANK0, false);
-    irq_remove_handler(IO_IRQ_BANK0, gpio_irq_exclusive_handler);
-    
-    // Disable PIO
-    pio_sm_set_enabled(pio, sm, false);
-    pio_remove_program(pio, &act_mirror_program, offset);
-    
-    printf("Core 1: PIO disabled\n");
-    
-    // Deinitialize SPI to avoid conflicts with WiFi
-    // NOTE: Commenting this out for testing - may be causing issues
-    // spi_deinit(spi0);
-    printf("Core 1: SPI deinit skipped (for testing)\n");
-    
-    printf("Core 1: Cleanup complete\n");
+    // NOTE: This code never executes in watchdog reset architecture
+    // Mode switching triggers full reboot via watchdog
 }
