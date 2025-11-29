@@ -2,7 +2,9 @@
  * par_spi.c - Core 1: Amiga SPI Bridge (Amiga Mode Only)
  * VERSION: 2024-11-28-CARD-FIX
  * 
- * Based on jbilander's verified working version
+ * Originally based on Niklas Ekström's October 2022 RP2040 version
+ * Adapted for jbilander's Pico 2 W hardware
+ * 
  * Runs on Core 1 when in MODE_AMIGA
  * Uses exclusive interrupt handler for fast response (~200-300ns)
  * PIO1 for ACT mirroring
