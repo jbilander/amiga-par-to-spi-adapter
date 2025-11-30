@@ -34,6 +34,7 @@
 #define configSUPPORT_DYNAMIC_ALLOCATION        1
 #define configTOTAL_HEAP_SIZE                   (128*1024)
 #define configAPPLICATION_ALLOCATED_HEAP        0
+#define configHEAP_ALLOCATE_FROM_SERIAL_HEAP    1
 
 /* Hook function related definitions. */
 #define configCHECK_FOR_STACK_OVERFLOW          0
@@ -63,7 +64,10 @@
 */
 
 /* SMP port only */
-#define configNUM_CORES                         2
+/* Enable SMP: number of physical cores to use */
+#define configNUMBER_OF_CORES          2
+#define configUSE_CORE_AFFINITY        1
+#define configUSE_PASSIVE_IDLE_HOOK    0
 #define configTICK_CORE                         0
 #define configRUN_MULTIPLE_PRIORITIES           0
 
