@@ -1,419 +1,191 @@
-/* main.c - Pico 2 W Amiga SPI Bridge with WiFi/FTP Mode Switching
- * VERSION: 2024-11-29-FREERTOS
- * 
- * Hardware: Raspberry Pi Pico 2 W (RP2350)
- * 
- * Two Modes (via watchdog reset):
- * - MODE_AMIGA: Core 1 runs Amiga SPI bridge (par_spi.c) - strict timing, no FreeRTOS
- * - MODE_WIFI:  Core 1 runs FTP server with FreeRTOS - socket API enabled
- * 
- * Mode switch: GPIO 13 button (50ms debounce)
- * 
- * Based on Niklas Ekström's October 2022 RP2040 version
- * Adapted for Pico 2 W by jbilander
- */
-
 #include "main.h"
-#include "pico/stdlib.h"
-#include "pico/multicore.h"
-#include "pico/mutex.h"
-#include "hardware/watchdog.h"
-#include "hardware/gpio.h"
-#include "pico/cyw43_arch.h"
-#include <stdio.h>
-#include <string.h>
+#include <stdlib.h>
+#include <pico/stdlib.h>
+#include <pico/stdio.h>
+#include <pico/multicore.h>
+#include <pico/cyw43_arch.h>
+#include <hardware/watchdog.h>
+#include <hardware/sync.h>
+#include <FreeRTOS.h>
+#include <task.h>
 
-// FreeRTOS includes (only used in WiFi mode)
-#include "FreeRTOS.h"
-#include "task.h"
+// CORE_0_AFFINITY_MASK (1U << 0U) or just tskNO_AFFINITY if that task is the only one intended for core 0
+#define CORE_0_AFFINITY_MASK (1U << 0U)
+#define CORE_1_AFFINITY_MASK (1U << 1U)
 
-// FTP Server
-#include "ftp_server.h"
-#include "ff.h"
+// Define magic values for boot modes (must be non-zero)
+#define BOOT_MODE_BARE_METAL 0xBEEF0001
+#define BOOT_MODE_FREERTOS   0xBEEF0002
+#define BOOT_FLAG_ADDR       (watchdog_hw->scratch + 6) // Use scratch register 6
 
-// ============================================================================
-// Global Variables
-// ============================================================================
+// --- Function Prototypes ---
+void launch_freertos_mode(void);
+void launch_bare_metal_mode(void);
+void trigger_reboot_to_mode(uint32_t mode_flag);
+void monitor_button_for_mode_switch(uint32_t current_mode);
 
-// SPI Mutex (for FatFS library dependency)
-mutex_t spi_mutex;
-
-// Current operating mode (set at boot from watchdog scratch register)
-volatile system_mode_t current_mode = MODE_AMIGA;
-
-// Card detect override flag (used in Amiga mode to prevent corruption during mode switch)
-volatile bool card_detect_override = false;
-
-// ============================================================================
-// Watchdog Magic Values (stored in scratch registers across reset)
-// ============================================================================
-
-#define BOOT_MODE_AMIGA_MAGIC   0xA3165A00
-#define BOOT_MODE_WIFI_MAGIC    0xF1F00000
-
-// ============================================================================
-// Version String
-// ============================================================================
-
-#define VERSION_STRING "2024-11-29-FREERTOS"
-
-// ============================================================================
-// GPIO Button Debouncing
-// ============================================================================
-
-#define BUTTON_DEBOUNCE_MS 50
-
-static uint32_t last_button_press = 0;
-
-// ============================================================================
-// Core 1 Entry Point (launched from main)
-// ============================================================================
-
-void core1_entry(void) {
-    if (current_mode == MODE_AMIGA) {
-        // Amiga mode: Run SPI bridge with exclusive IRQ handling
-        // NO FreeRTOS - strict timing preserved (~200-300ns response)
-        par_spi_main();
-    } else {
-        // WiFi mode: Run FTP server with FreeRTOS
-        // FreeRTOS scheduler starts here (vTaskStartScheduler)
-        ftp_server_main();
-    }
+void trigger_reboot_to_mode(uint32_t mode_flag) {
+    // Disable interrupts while accessing critical hardware
+    uint32_t status = save_and_disable_interrupts(); 
+    
+    // Write the desired boot mode flag to the non-volatile scratch register
+    *BOOT_FLAG_ADDR = mode_flag;
+    
+    restore_interrupts(status);
+    
+    // Set watchdog to trigger in 100ms
+    watchdog_enable(100, 1); 
+    while(1); // Wait for reboot
 }
 
-// ============================================================================
-// Mode Switching Functions
-// ============================================================================
+void monitor_button_for_mode_switch(uint32_t current_mode) {
+    static bool button_pressed_prev = false;
+    static absolute_time_t press_start_time;
 
-void switch_to_amiga_mode(void) {
-    printf("\n=== Switching to Amiga Mode ===\n");
-    
-    if (current_mode == MODE_WIFI) {
-        // Disconnect WiFi cleanly
-        printf("Disconnecting WiFi...\n");
-        cyw43_arch_deinit();
-    }
-    
-    // Set card detect override to prevent Amiga from accessing card during reboot
-    card_detect_override = true;
-    printf("Card detect override: ENABLED (Amiga will see card as NOT PRESENT)\n");
-    
-    // Send multiple IRQ pulses to ensure Amiga unmounts
-    printf("Sending IRQ pulses to Amiga to force unmount...\n");
-    for (int i = 0; i < 5; i++) {
-        gpio_put(PIN_IRQ, 0);
-        sleep_ms(100);
-        gpio_put(PIN_IRQ, 1);
-        sleep_ms(100);
-    }
-    
-    printf("Waiting for Amiga to unmount...\n");
-    sleep_ms(500);
-    
-    // Store magic value in watchdog scratch register
-    watchdog_hw->scratch[0] = BOOT_MODE_AMIGA_MAGIC;
-    printf("Watchdog scratch set: AMIGA mode\n");
-    
-    // Trigger watchdog reset
-    printf("Triggering watchdog reset...\n");
-    watchdog_reboot(0, 0, 10);
-    
-    // Wait for reset (should not return)
-    while (1) {
-        tight_loop_contents();
-    }
-}
+    // Read the current state of the button. 
+    // Assuming the button connects GPIO 13 to GND when pressed (using internal pull-up)
+    bool button_pressed_now = !gpio_get(PIN_MODE_SW); 
 
-void switch_to_wifi_mode(void) {
-    printf("\n=== Switching to WiFi Mode ===\n");
-    
-    // Set card detect override to prevent Amiga from accessing card during reboot
-    card_detect_override = true;
-    printf("Card detect override: ENABLED (Amiga will see card as NOT PRESENT)\n");
-    
-    // Send multiple IRQ pulses to ensure Amiga unmounts
-    printf("Sending IRQ pulses to Amiga to force unmount...\n");
-    for (int i = 0; i < 5; i++) {
-        gpio_put(PIN_IRQ, 0);
-        sleep_ms(100);
-        gpio_put(PIN_IRQ, 1);
-        sleep_ms(100);
-    }
-    
-    printf("Waiting for Amiga to unmount...\n");
-    sleep_ms(500);
-    
-    // Store magic value in watchdog scratch register
-    watchdog_hw->scratch[0] = BOOT_MODE_WIFI_MAGIC;
-    printf("Watchdog scratch set: WIFI mode\n");
-    
-    // Trigger watchdog reset
-    printf("Triggering watchdog reset...\n");
-    watchdog_reboot(0, 0, 10);
-    
-    // Wait for reset (should not return)
-    while (1) {
-        tight_loop_contents();
-    }
-}
+    if (button_pressed_now && !button_pressed_prev) {
+        // Button just pressed: start the timer
+        press_start_time = get_absolute_time();
+    } else if (button_pressed_now && button_pressed_prev) {
+        // Button is being held down: check duration
+        int64_t held_duration_ms = absolute_time_diff_us(press_start_time, get_absolute_time()) / 1000;
 
-// ============================================================================
-// Button Handler (Core 0 - Mode Manager)
-// ============================================================================
-
-static void handle_button_press(void) {
-    uint32_t now = to_ms_since_boot(get_absolute_time());
-    
-    // Debounce
-    if (now - last_button_press < BUTTON_DEBOUNCE_MS) {
-        return;
-    }
-    last_button_press = now;
-    
-    // Read button state
-    bool button_pressed = !gpio_get(PIN_MODE_SW);  // Active low (internal pull-up)
-    
-    if (!button_pressed) {
-        return;  // Button not pressed
-    }
-    
-    printf("\nButton pressed! Switching mode...\n");
-    
-    if (current_mode == MODE_AMIGA) {
-        switch_to_wifi_mode();
-    } else {
-        switch_to_amiga_mode();
-    }
-}
-
-// ============================================================================
-// Core 0: Mode Manager (runs in both modes)
-// ============================================================================
-
-static void core0_mode_manager(void) {
-    printf("Core 0: Mode manager starting...\n");
-    
-    // Main loop - monitor button
-    while (1) {
-        handle_button_press();
-        
-        if (current_mode == MODE_AMIGA) {
-            // Amiga mode - just sleep (LED on GPIO 28 handled by par_spi.c)
-            sleep_ms(1000);
-        } else {
-            // WiFi mode - blink WiFi LED
-            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-            sleep_ms(100);
-            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
-            sleep_ms(100);
+        if (held_duration_ms >= 3000) {
+            // Button held for 3 seconds or more: trigger the opposite mode reboot
+            printf("Button held for 3+ seconds! Invoking reboot.\n");
+            uint32_t next_mode = (current_mode == BOOT_MODE_FREERTOS) ? BOOT_MODE_BARE_METAL : BOOT_MODE_FREERTOS;
+            trigger_reboot_to_mode(next_mode);
         }
     }
+    
+    button_pressed_prev = button_pressed_now;
 }
 
-// ============================================================================
-// WiFi Connection (Core 0 - WiFi Mode Only)
-// ============================================================================
-
-static bool connect_wifi(void) {
-    printf("Connecting to WiFi (SSID: %s)...\n", WIFI_SSID);
+// -----------------------------------------------------------
+// BARE METAL MODE (No WiFi needed here)
+// -----------------------------------------------------------
+void launch_bare_metal_mode() {
+    printf("Entering bare metal mode (Core %d, WiFi Disabled).\n", get_core_num());
     
-    if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD, 
-                                            CYW43_AUTH_WPA2_AES_PSK, 30000)) {
-        printf("ERROR: Failed to connect to WiFi\n");
-        return false;
+    while (1) {
+        // Your primary bare metal application logic goes here
+        monitor_button_for_mode_switch(BOOT_MODE_BARE_METAL);
+        
+        sleep_ms(100); 
     }
-    
-    printf("WiFi connected!\n");
-    printf("IP Address: %s\n", ip4addr_ntoa(netif_ip4_addr(netif_list)));
-    
-    return true;
 }
 
-// ============================================================================
-// FTP Server Main (Core 1 - WiFi Mode Only)
-// ============================================================================
+// -----------------------------------------------------------
+// FREERTOS MODE (Uses WiFi/FTP/RAW LWIP API)
+// -----------------------------------------------------------
 
-// FTP server instance
-static ftp_server_t ftp_server;
-static FATFS fs;
+void ftp_server_application_task(void *pvParameters) {
+    printf("FTP Server Application Logic on Core: %d\n", get_core_num());
+    
+    while (1) {
+        // Your RAW LWIP FTP Server implementation starts here.
+        // Remember to use cyw43_arch_lwip_begin()/end() around network calls.
 
-// FTP task (runs as FreeRTOS task)
-static void ftp_task(__unused void *params) {
-    printf("FTP Task: Starting FTP server...\n");
-    
-    // Mount SD card filesystem
-    printf("FTP Task: Mounting SD card filesystem...\n");
-    FRESULT fr = f_mount(&fs, "", 1);
-    
-    if (fr != FR_OK) {
-        printf("FTP Task: ERROR - Failed to mount SD card (FR=%d)\n", fr);
-        printf("FTP Task: FTP server cannot start without SD card\n");
-        
-        // Flash LED fast to indicate error
-        while (current_mode == MODE_WIFI) {
-            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-            vTaskDelay(pdMS_TO_TICKS(100));
-            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        
-        f_mount(NULL, "", 0);
-        vTaskDelete(NULL);
-        return;
-    }
-    
-    printf("FTP Task: SD card mounted successfully\n");
-    
-    // Initialize FTP server
-    if (!ftp_server_init(&ftp_server, &fs)) {
-        printf("FTP Task: ERROR - Failed to initialize FTP server\n");
-        f_mount(NULL, "", 0);
-        vTaskDelete(NULL);
-        return;
-    }
-    
-    // Add users
-    ftp_server_add_user(&ftp_server, "amiga", "amiga");
-    ftp_server_add_user(&ftp_server, "admin", "admin");
-    
-    // Start FTP server
-    if (!ftp_server_begin(&ftp_server)) {
-        printf("FTP Task: ERROR - Failed to start FTP server\n");
-        f_mount(NULL, "", 0);
-        vTaskDelete(NULL);
-        return;
-    }
-    
-    printf("FTP Task: FTP server ready on port 21\n");
-    printf("FTP Task: Users: amiga/amiga, admin/admin\n");
-    
-    // Main FTP Loop (runs forever as FreeRTOS task)
-    while (current_mode == MODE_WIFI) {
-        ftp_server_handle(&ftp_server);
-        
-        // Yield to other tasks
+        monitor_button_for_mode_switch(BOOT_MODE_FREERTOS); // Monitor button in this task too
+
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    
-    // Cleanup when exiting WiFi mode (mode switch detected)
-    printf("FTP Task: Cleaning up FTP server...\n");
-    ftp_server_stop(&ftp_server);
-    
-    printf("FTP Task: Unmounting SD card...\n");
-    f_mount(NULL, "", 0);
-    
-    printf("FTP Task: FTP task ending\n");
-    vTaskDelete(NULL);
 }
 
-void ftp_server_main(void) {
-    printf("Core 1: Initializing WiFi mode with FreeRTOS...\n");
-    
-    // CRITICAL: FreeRTOS is ONLY initialized here, in WiFi mode!
-    // When in Amiga mode, par_spi_main() runs instead with no FreeRTOS.
-    
-    printf("Core 1: Creating FTP server task...\n");
-    
-    // Create FTP server task
-    xTaskCreate(
-        ftp_task,           // Task function
-        "FTP_Server",       // Task name
-        2048,              // Stack size (words)
-        NULL,              // Parameters
-        1,                 // Priority
-        NULL               // Task handle
+// --- FTP Server/WiFi Management Task ---
+void wifi_management_task(void *pvParameters) {
+    // This runs within the FreeRTOS context (likely core 0)
+
+    // *** Keep the short delay for stability with sys_freertos/threadsafe modes ***
+    vTaskDelay(pdMS_TO_TICKS(10)); 
+
+    // 1. Initialize Wi-Fi
+    if (cyw43_arch_init()) {
+        printf("Failed to init CYW43 on Core %d\n", get_core_num());
+        // In a real app, handle this gracefully
+        while(1) { vTaskDelay(1000); } 
+    }
+    printf("CYW43 initialized on Core: %d. Starting RAW FTP Server.\n", get_core_num());
+
+    // 2. Your RAW LWIP FTP Server task starts here (likely on core 1)
+    xTaskCreateAffinitySet(
+        ftp_server_application_task, 
+        "FTPTaskCore1", 
+        configMINIMAL_STACK_SIZE + 4096, 
+        NULL,
+        2,
+        CORE_1_AFFINITY_MASK,
+        NULL
     );
-    
-    printf("Core 1: Starting FreeRTOS scheduler (WiFi mode only)...\n");
-    
-    // Start FreeRTOS scheduler - THIS NEVER RETURNS!
-    // The scheduler will run the FTP task and handle lwIP
-    vTaskStartScheduler();
-    
-    // Should never reach here
-    printf("Core 1: ERROR - FreeRTOS scheduler returned!\n");
+
+    bool slask = true;
+
     while (1) {
-        tight_loop_contents();
+        monitor_button_for_mode_switch(BOOT_MODE_FREERTOS);
+        cyw43_arch_poll();
+
+        if (slask) {
+            slask = false;
+            printf("Polling started!!!\n");
+        }
+        vTaskDelay(pdMS_TO_TICKS(50)); // Yield slightly
     }
 }
 
-// ============================================================================
-// Main Entry Point
-// ============================================================================
+// --- RTOS Launcher ---
+void launch_freertos_mode() {
+    printf("Entering FreeRTOS mode (Core %d, WiFi Enabled).\n", get_core_num());
+
+    // Create the task that initializes WiFi and runs the server
+    xTaskCreateAffinitySet(
+        wifi_management_task, 
+        "WiFiMgrCore0", 
+        configMINIMAL_STACK_SIZE + 4096, 
+        NULL,
+        1,
+        CORE_0_AFFINITY_MASK,
+        NULL
+    );
+
+    // Start the scheduler, execution stops here.
+    vTaskStartScheduler(); 
+    // The scheduler takes over permanently.
+}
 
 int main() {
-    // Initialize stdio
     stdio_init_all();
-    sleep_ms(2000);  // Wait for USB serial
-
-    // Initialize SPI mutex (for FatFS)
-    mutex_init(&spi_mutex);
     
-    printf("\n\n");
-    printf("============================================================\n");
-    printf("  Pico 2 W - Amiga SPI Bridge / WiFi FTP Server\n");
-    printf("  VERSION: %s\n", VERSION_STRING);
-    printf("============================================================\n");
-    
-    // Check watchdog scratch register to determine boot mode
-    uint32_t mode_magic = watchdog_hw->scratch[0];
-    
-    if (mode_magic == BOOT_MODE_WIFI_MAGIC) {
-        current_mode = MODE_WIFI;
-        printf("Boot mode: WiFi (from watchdog scratch register)\n");
-    } else {
-        current_mode = MODE_AMIGA;
-        printf("Boot mode: Amiga (default or from watchdog scratch register)\n");
-    }
-    
-    // Clear watchdog scratch register
-    watchdog_hw->scratch[0] = 0;
-    
-    // Initialize GPIO button (internal pull-up, active low)
-    printf("Initializing GPIO %d button...\n", PIN_MODE_SW);
+    // --- Initialize GPIO 13 for input with pull-up resistor ---
     gpio_init(PIN_MODE_SW);
     gpio_set_dir(PIN_MODE_SW, GPIO_IN);
     gpio_pull_up(PIN_MODE_SW);
-    
-    // Mode-specific initialization
-    if (current_mode == MODE_WIFI) {
-        printf("\n=== WiFi Mode ===\n");
-        
-        // Initialize WiFi chip (ONLY in WiFi mode - requires FreeRTOS)
-        printf("Initializing WiFi chip...\n");
-        if (cyw43_arch_init()) {
-            printf("ERROR: Failed to initialize WiFi chip\n");
-            return 1;
+    // ----------------------------------------------------------
+
+    sleep_ms(3000);
+
+    // Check if we just rebooted from the watchdog and a flag is set
+    if (watchdog_enable_caused_reboot()) {
+        uint32_t boot_flag = *BOOT_FLAG_ADDR;
+        printf("Watchdog reboot detected. Boot flag read: 0x%lX\n", boot_flag); // Print the flag value
+
+        // Clear the flag immediately after reading it
+        *BOOT_FLAG_ADDR = 0;
+
+        if (boot_flag == BOOT_MODE_FREERTOS) {
+            launch_freertos_mode(); // Calls vTaskStartScheduler()
+        } else {
+            // Unknown flag, or BOOT_MODE_BARE_METAL, launch bare metal
+            launch_bare_metal_mode(); // Enters while(1) loop
         }
-        
-        // Connect to WiFi
-        if (!connect_wifi()) {
-            printf("ERROR: WiFi connection failed, cannot start FTP server\n");
-            // Flash LED rapidly to indicate error
-            while (1) {
-                cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-                sleep_ms(100);
-                cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
-                sleep_ms(100);
-            }
-        }
-        
-        printf("\nCore 0: WiFi mode manager starting...\n");
-        printf("Press GPIO %d button to switch to Amiga mode\n\n", PIN_MODE_SW);
-        
     } else {
-        printf("\n=== Amiga Mode ===\n");
-        printf("Core 0: Amiga mode manager starting...\n");
-        printf("Press GPIO %d button to switch to WiFi mode\n\n", PIN_MODE_SW);
+        // First power-on (e.g., USB connected, not watchdog reboot), default to a safe mode
+        printf("Normal power-on detected. Launching bare metal.\n");
+        launch_bare_metal_mode(); // Or your preferred default mode
     }
-    
-    // Launch Core 1
-    printf("Launching Core 1...\n");
-    multicore_launch_core1(core1_entry);
-    
-    // Core 0 continues with mode manager
-    core0_mode_manager();
-    
-    // Should never reach here
+
+    // Never reached
     return 0;
 }
