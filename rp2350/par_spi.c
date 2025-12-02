@@ -1,6 +1,6 @@
 /*
- * par_spi.c - Core 1: Amiga SPI Bridge (Bare Metal Mode)
- * VERSION: 2024-11-30-WATCHDOG-REBOOT
+ * par_spi.c - Amiga SPI Bridge (Bare Metal Mode)
+ * VERSION: 2024-12-02-WATCHDOG-REBOOT
  * 
  * Originally based on Niklas Ekström's October 2022 RP2040 version
  * Adapted for jbilander's Pico 2 W hardware with watchdog-based mode switching
@@ -266,6 +266,10 @@ void par_spi_main(void) {
 
     gpio_init(PIN_ACT);
     gpio_put(PIN_ACT, 1);
+    
+    gpio_init(PIN_IRQ);
+    gpio_set_dir(PIN_IRQ, GPIO_IN);  // Input by default, pulsed as output for signals
+    gpio_pull_up(PIN_IRQ);  // External pull-up exists, but enable internal too
 
     // === Initialize PIO for ACT mirroring (use PIO1, PIO0 used by WiFi) ===
     PIO pio = pio1;

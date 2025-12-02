@@ -60,6 +60,7 @@ void launch_freertos_mode(void);
 void launch_bare_metal_mode(void);
 void trigger_reboot_to_mode(uint32_t mode_flag);
 void monitor_button_for_mode_switch(uint32_t current_mode);
+void signal_interrupt_to_amiga(void);  // Signal Amiga before mode switch
 
 // ============================================================================
 // Synchronization

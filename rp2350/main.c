@@ -9,7 +9,30 @@
 #include <FreeRTOS.h>
 #include <task.h>
 
+// Signal interrupt to Amiga before mode switch
+// Sends IRQ pulses to notify Amiga that card state will change
+void signal_interrupt_to_amiga(void) {
+    printf("Signaling interrupt to Amiga...\n");
+    
+    // Initialize IRQ pin if not already done
+    gpio_init(PIN_IRQ);
+    gpio_set_dir(PIN_IRQ, GPIO_OUT);
+    gpio_put(PIN_IRQ, 1);  // Start high (inactive)
+    
+    // Send IRQ pulses to notify Amiga
+    for (int i = 0; i < 5; i++) {
+        gpio_put(PIN_IRQ, 0);   // IRQ low (active)
+        sleep_ms(100);
+        gpio_put(PIN_IRQ, 1);   // IRQ high (inactive)
+        sleep_ms(100);
+    }
+}
+
 void trigger_reboot_to_mode(uint32_t mode_flag) {
+    // Signal interrupt BEFORE disabling interrupts
+    // (This needs interrupts enabled for sleep_ms to work)
+    signal_interrupt_to_amiga();
+    
     // Disable interrupts while accessing critical hardware
     uint32_t status = save_and_disable_interrupts(); 
     
@@ -17,6 +40,8 @@ void trigger_reboot_to_mode(uint32_t mode_flag) {
     *BOOT_FLAG_ADDR = mode_flag;
     
     restore_interrupts(status);
+    
+    printf("Triggering watchdog reboot to mode 0x%lX...\n", mode_flag);
     
     // Set watchdog to trigger in 100ms
     watchdog_enable(100, 1); 
@@ -26,24 +51,34 @@ void trigger_reboot_to_mode(uint32_t mode_flag) {
 void monitor_button_for_mode_switch(uint32_t current_mode) {
     static bool button_pressed_prev = false;
     static absolute_time_t press_start_time;
+    static bool reboot_triggered = false;  // Prevent multiple triggers
 
-    // Read the current state of the button. 
+    // Read the current state of the button
     // Assuming the button connects GPIO 13 to GND when pressed (using internal pull-up)
     bool button_pressed_now = !gpio_get(PIN_MODE_SW); 
 
     if (button_pressed_now && !button_pressed_prev) {
         // Button just pressed: start the timer
         press_start_time = get_absolute_time();
+        reboot_triggered = false;  // Reset flag on new button press
+        
     } else if (button_pressed_now && button_pressed_prev) {
         // Button is being held down: check duration
         int64_t held_duration_ms = absolute_time_diff_us(press_start_time, get_absolute_time()) / 1000;
 
-        if (held_duration_ms >= 3000) {
-            // Button held for 3 seconds or more: trigger the opposite mode reboot
+        if (held_duration_ms >= 3000 && !reboot_triggered) {  // NEW: Check flag
+            // Button held for 3 seconds - trigger ONCE
+            reboot_triggered = true;  // NEW: Set flag to prevent re-trigger
+            
             printf("Button held for 3+ seconds! Invoking reboot.\n");
             uint32_t next_mode = (current_mode == BOOT_MODE_FREERTOS) ? BOOT_MODE_BARE_METAL : BOOT_MODE_FREERTOS;
             trigger_reboot_to_mode(next_mode);
+            // Note: Should never return from trigger_reboot_to_mode (watchdog reboot)
         }
+        
+    } else if (!button_pressed_now && button_pressed_prev) {
+        // Button released (for completeness - rarely used since reboot happens)
+        reboot_triggered = false;
     }
     
     button_pressed_prev = button_pressed_now;
