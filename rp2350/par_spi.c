@@ -1,17 +1,19 @@
 /*
- * par_spi.c - Core 1: Amiga SPI Bridge (Amiga Mode Only)
- * VERSION: 2024-11-29-FREERTOS
+ * par_spi.c - Core 1: Amiga SPI Bridge (Bare Metal Mode)
+ * VERSION: 2024-11-30-WATCHDOG-REBOOT
  * 
  * Originally based on Niklas Ekström's October 2022 RP2040 version
- * Adapted for jbilander's Pico 2 W hardware
+ * Adapted for jbilander's Pico 2 W hardware with watchdog-based mode switching
  * 
- * Runs on Core 1 when in MODE_AMIGA
+ * Runs in BOOT_MODE_BARE_METAL (called from launch_bare_metal_mode)
  * Uses exclusive interrupt handler for fast response (~200-300ns)
  * PIO1 for ACT mirroring
+ * Monitors GPIO 13 button for 3-second hold to trigger reboot to FreeRTOS mode
  * 
- * Changes for watchdog reset architecture:
- * - No core1_entry() - called directly by main.c's core1_entry()
- * - Supports card_detect_override flag for clean unmounting
+ * Watchdog reboot architecture:
+ * - par_spi_main() called directly from launch_bare_metal_mode()
+ * - Periodically checks button via monitor_button_for_mode_switch()
+ * - 3-second button hold triggers watchdog reboot to FreeRTOS mode
  */
 
 #include "main.h"
@@ -31,6 +33,10 @@ static volatile bool card_detect_enabled = true;
 // Card detect debouncing (prevents spurious interrupts from mechanical bouncing)
 #define CARD_DETECT_DEBOUNCE_MS 50  // 50ms debounce time
 static volatile uint32_t last_card_detect_time = 0;
+
+// Button monitoring interval (check button every 100ms when idle)
+#define BUTTON_CHECK_INTERVAL_MS 100
+static absolute_time_t last_button_check_time;
 
 /*
  * EXCLUSIVE GPIO interrupt handler 
@@ -205,13 +211,8 @@ static void handle_request() {
                         return;
                 }
 
-                // Check override flag first - if set, always report "not present"
-                bool card_present;
-                if (card_detect_override) {
-                    card_present = false;  // Force "not present" during mode switch
-                } else {
-                    card_present = !gpio_get(PIN_CDET);  // Normal: read actual GPIO
-                }
+                // Read actual card detect GPIO
+                bool card_present = !gpio_get(PIN_CDET);
                 
                 gpio_put(PIN_D(0), card_present);
                 gpio_set_dir_out_masked(0xff);
@@ -238,12 +239,12 @@ static void handle_request() {
 }
 
 // ============================================================================
-// Amiga Bridge Main (runs on Core 1 in Amiga mode)
-// Called by main.c's core1_entry() when current_mode == MODE_AMIGA
+// Amiga Bridge Main (runs in Bare Metal Mode)
+// Called from launch_bare_metal_mode() in main.c
 // ============================================================================
 
 void par_spi_main(void) {
-    printf("Core 1: Initializing Amiga bridge...\n");
+    printf("Amiga SPI Bridge: Initializing on Core %d...\n", get_core_num());
     
     // Initialize SPI
     spi_init(spi0, SPI_SLOW_FREQUENCY);
@@ -285,18 +286,35 @@ void par_spi_main(void) {
     irq_set_priority(IO_IRQ_BANK0, 0);  // Highest priority
     irq_set_enabled(IO_IRQ_BANK0, true);
 
-    printf("Core 1: PIO1 ACT mirroring enabled\n");
-    printf("Core 1: Exclusive handler installed (fast interrupts ~200-300ns)\n");
-    printf("Core 1: Amiga bridge ready\n");
+    printf("Amiga SPI Bridge: PIO1 ACT mirroring enabled\n");
+    printf("Amiga SPI Bridge: Exclusive handler installed (fast interrupts ~200-300ns)\n");
+    printf("Amiga SPI Bridge: Ready - waiting for Amiga requests\n");
+    printf("Amiga SPI Bridge: Hold GPIO 13 button for 3 seconds to switch to FreeRTOS mode\n");
     
-    // Main loop - runs forever in Amiga mode
-    // (Watchdog reset is only way to exit)
+    // Initialize button check timer
+    last_button_check_time = get_absolute_time();
+    
+    // Main loop - runs forever in Bare Metal mode
+    // Watchdog reboot is triggered by 3-second button hold
     while (1) {
         req_triggered = false;
         
-        // Wait for interrupt
-        // This wakes on: REQ interrupt or card detect interrupt
-        __wfe();
+        // Wait for interrupt with timeout for button checking
+        // Using best_effort_wfe_or_timeout instead of __wfe() to allow periodic button checks
+        absolute_time_t timeout_time = make_timeout_time_ms(BUTTON_CHECK_INTERVAL_MS);
+        best_effort_wfe_or_timeout(timeout_time);
+        
+        // Check if it's time to monitor button (every 100ms)
+        absolute_time_t now = get_absolute_time();
+        if (absolute_time_diff_us(last_button_check_time, now) >= (BUTTON_CHECK_INTERVAL_MS * 1000)) {
+            // Defined in main.c - checks for 3-second button hold
+            // If button held for 3+ seconds, triggers watchdog reboot to BOOT_MODE_FREERTOS
+            extern void monitor_button_for_mode_switch(uint32_t current_mode);
+            // BOOT_MODE_BARE_METAL is a #define from main.c, available via main.h
+            monitor_button_for_mode_switch(BOOT_MODE_BARE_METAL);
+            
+            last_button_check_time = now;
+        }
         
         if (req_triggered) {
             gpio_put(PIN_LED, 1);  // SPI activity LED on (GPIO 28)
@@ -319,6 +337,5 @@ void par_spi_main(void) {
         }
     }
     
-    // NOTE: This code never executes in watchdog reset architecture
-    // Mode switching triggers full reboot via watchdog
+    // NOTE: This code never executes - watchdog reboot switches modes
 }

@@ -9,21 +9,6 @@
 #include <FreeRTOS.h>
 #include <task.h>
 
-// CORE_0_AFFINITY_MASK (1U << 0U) or just tskNO_AFFINITY if that task is the only one intended for core 0
-#define CORE_0_AFFINITY_MASK (1U << 0U)
-#define CORE_1_AFFINITY_MASK (1U << 1U)
-
-// Define magic values for boot modes (must be non-zero)
-#define BOOT_MODE_BARE_METAL 0xBEEF0001
-#define BOOT_MODE_FREERTOS   0xBEEF0002
-#define BOOT_FLAG_ADDR       (watchdog_hw->scratch + 6) // Use scratch register 6
-
-// --- Function Prototypes ---
-void launch_freertos_mode(void);
-void launch_bare_metal_mode(void);
-void trigger_reboot_to_mode(uint32_t mode_flag);
-void monitor_button_for_mode_switch(uint32_t current_mode);
-
 void trigger_reboot_to_mode(uint32_t mode_flag) {
     // Disable interrupts while accessing critical hardware
     uint32_t status = save_and_disable_interrupts(); 
@@ -70,11 +55,12 @@ void monitor_button_for_mode_switch(uint32_t current_mode) {
 void launch_bare_metal_mode() {
     printf("Entering bare metal mode (Core %d, WiFi Disabled).\n", get_core_num());
     
+    // Launch Amiga SPI bridge
+    par_spi_main();
+    
+    // Should never reach here
     while (1) {
-        // Your primary bare metal application logic goes here
-        monitor_button_for_mode_switch(BOOT_MODE_BARE_METAL);
-        
-        sleep_ms(100); 
+        sleep_ms(1000);
     }
 }
 
@@ -83,7 +69,7 @@ void launch_bare_metal_mode() {
 // -----------------------------------------------------------
 
 void ftp_server_application_task(void *pvParameters) {
-    printf("FTP Server Application Logic on Core: %d\n", get_core_num());
+    printf("Starting RAW FTP Server on Core: %d\n", get_core_num());
     
     while (1) {
         // Your RAW LWIP FTP Server implementation starts here.
@@ -106,9 +92,9 @@ void wifi_management_task(void *pvParameters) {
     if (cyw43_arch_init()) {
         printf("Failed to init CYW43 on Core %d\n", get_core_num());
         // In a real app, handle this gracefully
-        while(1) { vTaskDelay(1000); } 
+        while(1) { vTaskDelay(1000); }
     }
-    printf("CYW43 initialized on Core: %d. Starting RAW FTP Server.\n", get_core_num());
+    printf("CYW43 initialized on Core: %d.\n", get_core_num());
 
     // 2. Your RAW LWIP FTP Server task starts here (likely on core 1)
     xTaskCreateAffinitySet(
@@ -121,16 +107,10 @@ void wifi_management_task(void *pvParameters) {
         NULL
     );
 
-    bool slask = true;
-
     while (1) {
         monitor_button_for_mode_switch(BOOT_MODE_FREERTOS);
         cyw43_arch_poll();
 
-        if (slask) {
-            slask = false;
-            printf("Polling started!!!\n");
-        }
         vTaskDelay(pdMS_TO_TICKS(50)); // Yield slightly
     }
 }
