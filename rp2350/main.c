@@ -8,6 +8,7 @@
 #include <hardware/sync.h>
 #include <FreeRTOS.h>
 #include <task.h>
+#include <lwip/netif.h>
 
 // Signal interrupt to Amiga before mode switch
 // Sends single short IRQ pulse to notify Amiga that card state will change
@@ -68,9 +69,9 @@ void monitor_button_for_mode_switch(uint32_t current_mode) {
         // Button is being held down: check duration
         int64_t held_duration_ms = absolute_time_diff_us(press_start_time, get_absolute_time()) / 1000;
 
-        if (held_duration_ms >= 3000 && !reboot_triggered) {  // NEW: Check flag
+        if (held_duration_ms >= 3000 && !reboot_triggered) {
             // Button held for 3 seconds - trigger ONCE
-            reboot_triggered = true;  // NEW: Set flag to prevent re-trigger
+            reboot_triggered = true;  // Set flag to prevent re-trigger
             
             printf("Button held for 3+ seconds! Invoking reboot.\n");
             uint32_t next_mode = (current_mode == BOOT_MODE_FREERTOS) ? BOOT_MODE_BARE_METAL : BOOT_MODE_FREERTOS;
@@ -106,11 +107,12 @@ void launch_bare_metal_mode() {
 // -----------------------------------------------------------
 
 void ftp_server_application_task(void *pvParameters) {
-    printf("Starting RAW FTP Server on Core: %d\n", get_core_num());
+    printf("FTP Task: Starting on Core %d\n", get_core_num());
     
     while (1) {
         // Your RAW LWIP FTP Server implementation starts here.
         // Remember to use cyw43_arch_lwip_begin()/end() around network calls.
+        // TODO: Initialize and run FTP server here
 
         monitor_button_for_mode_switch(BOOT_MODE_FREERTOS); // Monitor button in this task too
 
@@ -120,20 +122,116 @@ void ftp_server_application_task(void *pvParameters) {
 
 // --- FTP Server/WiFi Management Task ---
 void wifi_management_task(void *pvParameters) {
-    // This runs within the FreeRTOS context (likely core 0)
-
-    // *** Keep the short delay for stability with sys_freertos/threadsafe modes ***
-    vTaskDelay(pdMS_TO_TICKS(10)); 
-
-    // 1. Initialize Wi-Fi
+    printf("WiFi Management Task: Starting on Core %d\n", get_core_num());
+    
+    // Brief delay for stability
+    vTaskDelay(pdMS_TO_TICKS(10));
+    
+    // ========================================================================
+    // STEP 1: Initialize WiFi Chip
+    // ========================================================================
+    printf("WiFi: Initializing CYW43 chip...\n");
+    
     if (cyw43_arch_init()) {
-        printf("Failed to init CYW43 on Core %d\n", get_core_num());
-        // In a real app, handle this gracefully
-        while(1) { vTaskDelay(1000); }
+        printf("WiFi: ERROR - Failed to initialize CYW43 chip!\n");
+        printf("WiFi: Fast blinking LED indicates initialization failure\n");
+        
+        // Fast blink = hardware failure
+        while (1) {
+            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+            vTaskDelay(pdMS_TO_TICKS(LED_BLINK_FAST_MS));
+            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+            vTaskDelay(pdMS_TO_TICKS(LED_BLINK_FAST_MS));
+            
+            // Still monitor button even during error
+            monitor_button_for_mode_switch(BOOT_MODE_FREERTOS);
+        }
     }
-    printf("CYW43 initialized on Core: %d.\n", get_core_num());
-
-    // 2. Your RAW LWIP FTP Server task starts here (likely on core 1)
+    
+    printf("WiFi: CYW43 chip initialized successfully\n");
+    
+    // Turn LED ON (solid) to indicate FreeRTOS mode active
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+    printf("WiFi: LED solid on - FreeRTOS mode active\n");
+    
+    // ========================================================================
+    // STEP 2: Enable WiFi Station Mode
+    // ========================================================================
+    printf("WiFi: Enabling station mode...\n");
+    cyw43_arch_enable_sta_mode();
+    
+    // Brief pause with LED solid before starting connection
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // ========================================================================
+    // STEP 3: Connect to WiFi Network
+    // ========================================================================
+    printf("WiFi: Connecting to network '%s'...\n", WIFI_SSID);
+    printf("WiFi: Medium blinking LED indicates connecting\n");
+    
+    // Blink while connecting (non-blocking with timeout)
+    uint32_t connect_attempts = 0;
+    const uint32_t max_attempts = 3;  // 30 seconds timeout
+    
+    while (connect_attempts < max_attempts) {
+        // Try non-blocking connect (1 second timeout per attempt)
+        int result = cyw43_arch_wifi_connect_timeout_ms(
+            WIFI_SSID, 
+            WIFI_PASSWORD,
+            CYW43_AUTH_WPA2_AES_PSK, 
+            30000  // 30 second per attempt
+        );
+        
+        if (result == 0) {
+            // Connected successfully!
+            break;
+        }
+        
+        // Blink LED while connecting
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(LED_BLINK_CONNECT_MS));
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(LED_BLINK_CONNECT_MS));
+        
+        connect_attempts++;
+        
+        if (connect_attempts % 5 == 0) {
+            printf("WiFi: Still connecting... (attempt %ld/%ld)\n", connect_attempts, max_attempts);
+        }
+    }
+    
+    // Check if connection succeeded
+    if (connect_attempts >= max_attempts) {
+        printf("WiFi: ERROR - Failed to connect after %ld attempts\n", max_attempts);
+        printf("WiFi: Fast blinking LED indicates connection failure\n");
+        printf("WiFi: Check SSID/password in wifi_credentials.cmake\n");
+        
+        // Fast blink = connection failure
+        while (1) {
+            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+            vTaskDelay(pdMS_TO_TICKS(LED_BLINK_FAST_MS));
+            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+            vTaskDelay(pdMS_TO_TICKS(LED_BLINK_FAST_MS));
+            
+            // Still monitor button even during error
+            monitor_button_for_mode_switch(BOOT_MODE_FREERTOS);
+        }
+    }
+    
+    // ========================================================================
+    // STEP 4: WiFi Connected Successfully!
+    // ========================================================================
+    printf("WiFi: Connected successfully!\n");
+    printf("WiFi: IP Address: %s\n", ip4addr_ntoa(netif_ip4_addr(netif_list)));
+    printf("WiFi: Netmask:    %s\n", ip4addr_ntoa(netif_ip4_netmask(netif_list)));
+    printf("WiFi: Gateway:    %s\n", ip4addr_ntoa(netif_ip4_gw(netif_list)));
+    printf("WiFi: Slow blinking LED indicates connected\n");
+    
+    // ========================================================================
+    // STEP 5: Create FTP Server Task (on Core 1)
+    // ========================================================================
+    printf("WiFi: Creating FTP server task on Core 1...\n");
+    
     xTaskCreateAffinitySet(
         ftp_server_application_task, 
         "FTPTaskCore1", 
@@ -143,12 +241,31 @@ void wifi_management_task(void *pvParameters) {
         CORE_1_AFFINITY_MASK,
         NULL
     );
-
+    
+    printf("WiFi: FTP server task created\n");
+    
+    // ========================================================================
+    // STEP 6: Main Loop - Monitor Button + Slow Blink LED
+    // ========================================================================
+    bool led_state = false;
+    uint32_t last_blink_time = 0;
+    
     while (1) {
+        // Check button for mode switch
         monitor_button_for_mode_switch(BOOT_MODE_FREERTOS);
+        
+        // Poll WiFi/lwIP
         cyw43_arch_poll();
-
-        vTaskDelay(pdMS_TO_TICKS(50)); // Yield slightly
+        
+        // Slow blink LED to indicate connected state
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        if (now - last_blink_time >= LED_BLINK_SLOW_MS) {
+            led_state = !led_state;
+            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_state);
+            last_blink_time = now;
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -186,7 +303,7 @@ int main() {
     // Check if we just rebooted from the watchdog and a flag is set
     if (watchdog_enable_caused_reboot()) {
         uint32_t boot_flag = *BOOT_FLAG_ADDR;
-        printf("Watchdog reboot detected. Boot flag read: 0x%lX\n", boot_flag); // Print the flag value
+        printf("Watchdog reboot detected. Boot flag read: 0x%lX\n", boot_flag);
 
         // Clear the flag immediately after reading it
         *BOOT_FLAG_ADDR = 0;

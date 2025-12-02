@@ -36,6 +36,14 @@
 //   set(WIFI_PASSWORD "YourPassword")
 
 // ============================================================================
+// LED Status Indicators (CYW43 onboard LED)
+// ============================================================================
+
+#define LED_BLINK_FAST_MS    100   // Fast blink = error (init or connection failed)
+#define LED_BLINK_SLOW_MS    1000  // Slow blink = connected successfully
+#define LED_BLINK_CONNECT_MS 200   // Medium blink = connecting to WiFi
+
+// ============================================================================
 // Boot Mode Magic Values (stored in watchdog scratch register)
 // ============================================================================
 
