@@ -10,22 +10,24 @@
 #include <task.h>
 
 // Signal interrupt to Amiga before mode switch
-// Sends IRQ pulses to notify Amiga that card state will change
+// Sends single short IRQ pulse to notify Amiga that card state will change
 void signal_interrupt_to_amiga(void) {
     printf("Signaling interrupt to Amiga...\n");
     
     // Initialize IRQ pin if not already done
     gpio_init(PIN_IRQ);
-    gpio_set_dir(PIN_IRQ, GPIO_OUT);
-    gpio_put(PIN_IRQ, 1);  // Start high (inactive)
     
-    // Send IRQ pulses to notify Amiga
-    for (int i = 0; i < 5; i++) {
-        gpio_put(PIN_IRQ, 0);   // IRQ low (active)
-        sleep_ms(100);
-        gpio_put(PIN_IRQ, 1);   // IRQ high (inactive)
-        sleep_ms(100);
-    }
+    // Send SINGLE SHORT pulse matching real card detect interrupt
+    gpio_put(PIN_IRQ, false);      // IRQ low (active)
+    gpio_set_dir(PIN_IRQ, true);   // Set to output
+    
+    busy_wait_us(10);              // Brief pulse (10μs) - matches real interrupt
+    
+    gpio_set_dir(PIN_IRQ, false);  // Release to input (pulled up externally)
+    
+    // Wait for Amiga to process and unmount
+    printf("Waiting for Amiga to unmount...\n");
+    sleep_ms(500);
 }
 
 void trigger_reboot_to_mode(uint32_t mode_flag) {

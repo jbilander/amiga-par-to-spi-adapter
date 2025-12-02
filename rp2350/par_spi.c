@@ -298,6 +298,34 @@ void par_spi_main(void) {
     // Initialize button check timer
     last_button_check_time = get_absolute_time();
     
+    // Check if SD card is present and signal Amiga to mount it
+    // This is important when switching back from FreeRTOS mode
+    sleep_ms(100);  // Brief delay for hardware to stabilize
+    
+    bool card_present = !gpio_get(PIN_CDET);  // Active low
+    if (card_present) {
+        printf("Amiga SPI Bridge: SD card detected, signaling Amiga...\n");
+        
+        // CRITICAL: Initialize prev_cdet to "no card" to simulate insertion event
+        prev_cdet = (1 << PIN_CDET);  // Set bit = no card (active low)
+        
+        // Send SINGLE SHORT pulse matching real card detect interrupt
+        // (Not multiple long pulses - that confuses the Amiga driver)
+        gpio_put(PIN_IRQ, false);      // IRQ low (active)
+        gpio_set_dir(PIN_IRQ, true);   // Set to output
+        
+        busy_wait_us(10);              // Brief pulse (10μs)
+        
+        gpio_set_dir(PIN_IRQ, false);  // Release to input (pulled up externally)
+        
+        // Update prev_cdet to current state (card present)
+        prev_cdet = gpio_get_all() & (1 << PIN_CDET);
+        
+        printf("Amiga SPI Bridge: Card presence signal sent\n");
+    } else {
+        printf("Amiga SPI Bridge: No SD card detected\n");
+    }
+    
     // Main loop - runs forever in Bare Metal mode
     // Watchdog reboot is triggered by 3-second button hold
     while (1) {
