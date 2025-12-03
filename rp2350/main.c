@@ -106,16 +106,36 @@ void launch_bare_metal_mode() {
 // FREERTOS MODE (Uses WiFi/FTP/RAW LWIP API)
 // -----------------------------------------------------------
 
+// Updated ftp_server_application_task for main.c
+// Replace the existing function with this version
+
 void ftp_server_application_task(void *pvParameters) {
     printf("FTP Task: Starting on Core %d\n", get_core_num());
     
+    // Brief delay to ensure WiFi is fully ready
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    // Initialize FTP server
+    if (!ftp_server_init()) {
+        printf("FTP Task: Failed to initialize FTP server!\n");
+        // Stay in loop but don't process
+        while (1) {
+            monitor_button_for_mode_switch(BOOT_MODE_FREERTOS);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+    
+    printf("FTP Task: FTP server ready for connections\n");
+    
+    // Main FTP server loop
     while (1) {
-        // Your RAW LWIP FTP Server implementation starts here.
-        // Remember to use cyw43_arch_lwip_begin()/end() around network calls.
-        // TODO: Initialize and run FTP server here
-
-        monitor_button_for_mode_switch(BOOT_MODE_FREERTOS); // Monitor button in this task too
-
+        // Process FTP server (callbacks handle actual work)
+        ftp_server_process();
+        
+        // Monitor button for mode switch
+        monitor_button_for_mode_switch(BOOT_MODE_FREERTOS);
+        
+        // Small delay
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }

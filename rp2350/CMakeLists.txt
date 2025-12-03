@@ -59,7 +59,7 @@ add_executable(${PROJECT}
     main.c
     par_spi.c
 #    ftp_utils.c
-#    ftp_server.c
+    ftp_server.c
 #    util.c
 )
 

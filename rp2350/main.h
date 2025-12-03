@@ -85,8 +85,10 @@ extern mutex_t spi_mutex;
 // Runs in BOOT_MODE_BARE_METAL
 void par_spi_main(void);
 
-// FTP Server (defined in ftp_server.c)
+// FTP Server Functions (defined in ftp_server.c)
 // Runs in BOOT_MODE_FREERTOS
-void ftp_server_main(void);
+bool ftp_server_init(void);      // Initialize FTP server (call after WiFi connected)
+void ftp_server_process(void);   // Process FTP server (call in loop)
+void ftp_server_shutdown(void);  // Shutdown FTP server
 
 #endif // MAIN_H

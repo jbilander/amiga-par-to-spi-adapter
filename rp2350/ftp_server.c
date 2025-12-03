@@ -1,352 +1,413 @@
-/* ftp_server.c - FTP server with FatFS (runs on Core 1 in WiFi mode) */
+/**
+ * ftp_server.c - Simple FTP Server using raw lwIP API
+ * 
+ * This is a minimal FTP server for testing connectivity with FileZilla.
+ * Implements basic FTP commands to allow connection and authentication.
+ * 
+ * Uses raw lwIP API (not BSD sockets) with cyw43_arch_lwip_begin/end protection.
+ */
 
-#include "ftp_server.h"
-#include "ftp_utils.h"
 #include "main.h"
 #include <string.h>
 #include <stdio.h>
-#include "pico/stdlib.h"
+#include <pico/cyw43_arch.h>
+#include <lwip/tcp.h>
+#include <FreeRTOS.h>
+#include <task.h>
 
-// lwIP includes
-#include "lwip/opt.h"
-#include "lwip/sockets.h"
-#include "lwip/netdb.h"
-#include "lwip/inet.h"
+// FTP Server Configuration
+#define FTP_PORT        21
+#define FTP_USER        "pico"
+#define FTP_PASSWORD    "pico"
+#define FTP_MAX_CLIENTS 2
 
-// Global filesystem pointer
-static FATFS *g_fs = NULL;
+// FTP Response Codes
+#define FTP_RESP_220_WELCOME        "220 Pico FTP Server ready\r\n"
+#define FTP_RESP_331_USER_OK        "331 User name okay, need password\r\n"
+#define FTP_RESP_230_LOGIN_OK       "230 User logged in\r\n"
+#define FTP_RESP_530_LOGIN_FAILED   "530 Login incorrect\r\n"
+#define FTP_RESP_221_GOODBYE        "221 Goodbye\r\n"
+#define FTP_RESP_214_HELP           "214 Help: USER PASS QUIT SYST PWD TYPE\r\n"
+#define FTP_RESP_215_SYSTEM         "215 UNIX Type: L8\r\n"
+#define FTP_RESP_257_PWD            "257 \"/\" is current directory\r\n"
+#define FTP_RESP_200_TYPE_OK        "200 Type set to I\r\n"
+#define FTP_RESP_500_UNKNOWN        "500 Unknown command\r\n"
+#define FTP_RESP_502_NOT_IMPL       "502 Command not implemented\r\n"
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
+// Client Connection State
+typedef enum {
+    FTP_STATE_IDLE = 0,
+    FTP_STATE_USER_OK,
+    FTP_STATE_LOGGED_IN
+} ftp_state_t;
 
-static void init_session(ftp_session_t *session) {
-    memset(session, 0, sizeof(ftp_session_t));
-    session->ctrl_sock = -1;
-    session->data_sock = -1;
-    session->data_listen_sock = -1;
-    session->state = FTP_STATE_IDLE;
-    session->transfer_type = FTP_TYPE_BINARY;
-    session->data_mode = FTP_DATA_MODE_NONE;
-    session->transfer_state = FTP_TRANSFER_NONE;
-    ftp_path_init(&session->cwd);
-    session->rename_from_set = false;
+// Client Control Connection
+typedef struct ftp_client {
+    struct tcp_pcb *pcb;           // Control connection PCB
+    ftp_state_t state;             // Authentication state
+    char cmd_buffer[256];          // Command buffer
+    uint16_t cmd_len;              // Current command length
+    char username[32];             // Username provided by client
+    bool active;                   // Connection active flag
+} ftp_client_t;
+
+// Global FTP Server State
+static struct tcp_pcb *ftp_server_pcb = NULL;
+static ftp_client_t ftp_clients[FTP_MAX_CLIENTS];
+
+// Forward declarations
+static err_t ftp_accept(void *arg, struct tcp_pcb *newpcb, err_t err);
+static err_t ftp_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err);
+static void ftp_error(void *arg, err_t err);
+static void ftp_close_client(ftp_client_t *client);
+
+/**
+ * Send FTP response to client
+ */
+static err_t ftp_send_response(ftp_client_t *client, const char *response) {
+    if (!client || !client->pcb || !response) {
+        return ERR_ARG;
+    }
+    
+    size_t len = strlen(response);
+    err_t err;
+    
+    cyw43_arch_lwip_begin();
+    err = tcp_write(client->pcb, response, len, TCP_WRITE_FLAG_COPY);
+    if (err == ERR_OK) {
+        err = tcp_output(client->pcb);
+    }
+    cyw43_arch_lwip_end();
+    
+    if (err != ERR_OK) {
+        printf("FTP: Failed to send response, err=%d\n", err);
+    }
+    
+    return err;
 }
 
-static bool authenticate_user(const ftp_server_t *server, const char *username, const char *password) {
-    for (int i = 0; i < server->user_count; i++) {
-        if (strcmp(server->users[i].username, username) == 0 &&
-            strcmp(server->users[i].password, password) == 0) {
-            return true;
+/**
+ * Process FTP command
+ */
+static void ftp_process_command(ftp_client_t *client, char *cmd) {
+    // Trim trailing \r\n
+    char *end = cmd + strlen(cmd) - 1;
+    while (end > cmd && (*end == '\r' || *end == '\n' || *end == ' ')) {
+        *end = '\0';
+        end--;
+    }
+    
+    printf("FTP: Received command: '%s'\n", cmd);
+    
+    // Parse command (first word)
+    char *arg = strchr(cmd, ' ');
+    if (arg) {
+        *arg = '\0';
+        arg++;
+        // Trim leading spaces
+        while (*arg == ' ') arg++;
+    }
+    
+    // Convert command to uppercase
+    for (char *p = cmd; *p; p++) {
+        if (*p >= 'a' && *p <= 'z') {
+            *p = *p - 'a' + 'A';
         }
     }
-    return false;
-}
-
-// ============================================================================
-// Public API Implementation
-// ============================================================================
-
-bool ftp_server_init(ftp_server_t *server, FATFS *fs) {
-    if (!server || !fs) {
-        return false;
+    
+    // Handle commands based on current state
+    if (strcmp(cmd, "USER") == 0) {
+        if (arg) {
+            strncpy(client->username, arg, sizeof(client->username) - 1);
+            client->username[sizeof(client->username) - 1] = '\0';
+            client->state = FTP_STATE_USER_OK;
+            ftp_send_response(client, FTP_RESP_331_USER_OK);
+            printf("FTP: User '%s' requested login\n", client->username);
+        } else {
+            ftp_send_response(client, FTP_RESP_500_UNKNOWN);
+        }
     }
-
-    memset(server, 0, sizeof(ftp_server_t));
-    server->listen_sock = -1;
-    server->user_count = 0;
-    server->next_pasv_port = FTP_DATA_PORT_MIN;
-    init_session(&server->session);
-
-    g_fs = fs;
-    return true;
-}
-
-bool ftp_server_add_user(ftp_server_t *server, const char *username, const char *password) {
-    if (!server || !username || !password) {
-        return false;
-    }
-
-    if (server->user_count >= FTP_MAX_USERS) {
-        return false;
-    }
-
-    strncpy(server->users[server->user_count].username, username, FTP_USERNAME_MAX - 1);
-    server->users[server->user_count].username[FTP_USERNAME_MAX - 1] = '\0';
-
-    strncpy(server->users[server->user_count].password, password, FTP_PASSWORD_MAX - 1);
-    server->users[server->user_count].password[FTP_PASSWORD_MAX - 1] = '\0';
-
-    server->user_count++;
-    return true;
-}
-
-bool ftp_server_begin(ftp_server_t *server) {
-    if (!server) {
-        return false;
-    }
-
-    // Create listening socket
-    server->listen_sock = lwip_socket(AF_INET, SOCK_STREAM, 0);
-    if (server->listen_sock < 0) {
-        printf("FTP: Failed to create socket\n");
-        return false;
-    }
-
-    int opt = 1;
-    lwip_setsockopt(server->listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    int flags = lwip_fcntl(server->listen_sock, F_GETFL, 0);
-    lwip_fcntl(server->listen_sock, F_SETFL, flags | O_NONBLOCK);
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(FTP_CTRL_PORT);
-    addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (lwip_bind(server->listen_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        printf("FTP: Failed to bind to port %d\n", FTP_CTRL_PORT);
-        lwip_close(server->listen_sock);
-        server->listen_sock = -1;
-        return false;
-    }
-
-    if (lwip_listen(server->listen_sock, 1) < 0) {
-        printf("FTP: Failed to listen\n");
-        lwip_close(server->listen_sock);
-        server->listen_sock = -1;
-        return false;
-    }
-
-    printf("FTP: Server listening on port %d\n", FTP_CTRL_PORT);
-    return true;
-}
-
-void ftp_send_response(ftp_session_t *session, int code, const char *message) {
-    if (session->ctrl_sock < 0) {
-        return;
-    }
-
-    char response[FTP_RESPONSE_MAX];
-
-    // Limit %s safely
-    int max_msg = sizeof(response) - 8; // space for "XYZ " + CRLF
-    snprintf(response, sizeof(response),
-             "%d %.*s\r\n",
-             code,
-             max_msg,
-             message);
-
-    lwip_send(session->ctrl_sock, response, strlen(response), 0);
-
-    printf("FTP: >> %d %s\n", code, message);
-}
-
-void ftp_close_session(ftp_session_t *session) {
-    if (session->ctrl_sock >= 0) {
-        lwip_close(session->ctrl_sock);
-        printf("FTP: Client disconnected\n");
-    }
-    if (session->data_sock >= 0) {
-        lwip_close(session->data_sock);
-    }
-    if (session->data_listen_sock >= 0) {
-        lwip_close(session->data_listen_sock);
-    }
-    init_session(session);
-}
-
-void ftp_process_command(ftp_server_t *server, ftp_session_t *session) {
-    char *tokens[16];
-    char cmd_copy[FTP_CMD_BUFFER_SIZE];
-
-    strncpy(cmd_copy, session->cmd_buffer, FTP_CMD_BUFFER_SIZE - 1);
-    cmd_copy[FTP_CMD_BUFFER_SIZE - 1] = '\0';
-
-    int token_count = ftp_split_string(cmd_copy, ' ', tokens, 16);
-    if (token_count == 0) {
-        return;
-    }
-
-    ftp_command_t cmd = ftp_parse_command(tokens[0]);
-
-    printf("FTP: << %s\n", session->cmd_buffer);
-
-    switch (session->state) {
-        case FTP_STATE_IDLE:
-            if (cmd == FTP_CMD_USER) {
-                if (token_count >= 2) {
-                    strncpy(session->username, tokens[1], FTP_USERNAME_MAX - 1);
-                    session->username[FTP_USERNAME_MAX - 1] = '\0';
-                    session->state = FTP_STATE_USER;
-                    ftp_send_response(session, 331, "OK. Password required.");
-                } else {
-                    ftp_send_response(session, 501, "Syntax error in parameters.");
-                }
+    else if (strcmp(cmd, "PASS") == 0) {
+        if (client->state == FTP_STATE_USER_OK) {
+            // Simple authentication check
+            if (strcmp(client->username, FTP_USER) == 0 && 
+                arg && strcmp(arg, FTP_PASSWORD) == 0) {
+                client->state = FTP_STATE_LOGGED_IN;
+                ftp_send_response(client, FTP_RESP_230_LOGIN_OK);
+                printf("FTP: User '%s' logged in successfully\n", client->username);
             } else {
-                ftp_send_response(session, 530, "Please login with USER and PASS.");
+                client->state = FTP_STATE_IDLE;
+                ftp_send_response(client, FTP_RESP_530_LOGIN_FAILED);
+                printf("FTP: Login failed for user '%s'\n", client->username);
             }
-            break;
-
-        case FTP_STATE_USER:
-            if (cmd == FTP_CMD_PASS) {
-                const char *password = (token_count >= 2) ? tokens[1] : "";
-                if (authenticate_user(server, session->username, password)) {
-                    session->state = FTP_STATE_AUTHENTICATED;
-                    ftp_send_response(session, 230, "OK.");
-                    printf("FTP: User '%s' logged in\n", session->username);
-                } else {
-                    ftp_send_response(session, 430, "Invalid username or password.");
-                    session->state = FTP_STATE_IDLE;
-                    memset(session->username, 0, sizeof(session->username));
-                }
-            } else {
-                ftp_send_response(session, 503, "Login with USER first.");
-            }
-            break;
-
-        case FTP_STATE_AUTHENTICATED:
-            switch (cmd) {
-                case FTP_CMD_SYST:
-                    ftp_send_response(session, 215, "UNIX Type: L8");
-                    break;
-
-                case FTP_CMD_NOOP:
-                    ftp_send_response(session, 200, "NOOP command successful.");
-                    break;
-
-                case FTP_CMD_FEAT:
-                    lwip_send(session->ctrl_sock, "211-Features:\r\n", 15, 0);
-                    lwip_send(session->ctrl_sock, " MLSD\r\n", 7, 0);
-                    lwip_send(session->ctrl_sock, " MFMT\r\n", 7, 0);
-                    lwip_send(session->ctrl_sock, " MFCT\r\n", 7, 0);
-                    lwip_send(session->ctrl_sock, " PASV\r\n", 7, 0);
-                    ftp_send_response(session, 211, "End");
-                    break;
-
-                case FTP_CMD_QUIT:
-                    ftp_send_response(session, 221, "Goodbye.");
-                    ftp_close_session(session);
-                    break;
-
-                case FTP_CMD_PWD: {
-                        char msg[FTP_RESPONSE_MAX];
-                        int space = sizeof(msg) - 25; // room for quotes + suffix
-                        snprintf(msg, sizeof(msg),
-                                 "\"%.*s\" is current directory.",
-                                 space,
-                                 session->cwd.path);
-                        ftp_send_response(session, 257, msg);
-                    }
-                    break;
-
-                case FTP_CMD_TYPE:
-                    if (token_count >= 2) {
-                        if (strcmp(tokens[1], "A") == 0) {
-                            session->transfer_type = FTP_TYPE_ASCII;
-                            ftp_send_response(session, 200, "TYPE is now ASCII");
-                        } else if (strcmp(tokens[1], "I") == 0) {
-                            session->transfer_type = FTP_TYPE_BINARY;
-                            ftp_send_response(session, 200, "TYPE is now 8-bit binary");
-                        } else {
-                            ftp_send_response(session, 504, "Unknown TYPE");
-                        }
-                    } else {
-                        ftp_send_response(session, 501, "Syntax error in parameters.");
-                    }
-                    break;
-
-                default:
-                    ftp_send_response(session, 502, "Command not implemented (yet).");
-                    break;
-            }
-            break;
+        } else {
+            ftp_send_response(client, FTP_RESP_500_UNKNOWN);
+        }
+    }
+    else if (strcmp(cmd, "QUIT") == 0) {
+        ftp_send_response(client, FTP_RESP_221_GOODBYE);
+        printf("FTP: Client disconnecting\n");
+        // Client will be closed after response is sent
+        vTaskDelay(pdMS_TO_TICKS(100)); // Give time for response to send
+        ftp_close_client(client);
+    }
+    else if (strcmp(cmd, "SYST") == 0) {
+        ftp_send_response(client, FTP_RESP_215_SYSTEM);
+    }
+    else if (strcmp(cmd, "PWD") == 0 || strcmp(cmd, "XPWD") == 0) {
+        ftp_send_response(client, FTP_RESP_257_PWD);
+    }
+    else if (strcmp(cmd, "TYPE") == 0) {
+        // Accept any TYPE command (usually TYPE I for binary)
+        ftp_send_response(client, FTP_RESP_200_TYPE_OK);
+    }
+    else if (strcmp(cmd, "HELP") == 0) {
+        ftp_send_response(client, FTP_RESP_214_HELP);
+    }
+    else {
+        // Unknown or not yet implemented command
+        printf("FTP: Unknown/unimplemented command: %s\n", cmd);
+        ftp_send_response(client, FTP_RESP_502_NOT_IMPL);
     }
 }
 
-void ftp_server_handle(ftp_server_t *server) {
-    if (!server || server->listen_sock < 0) {
-        return;
+/**
+ * TCP receive callback - called when data is received from client
+ */
+static err_t ftp_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
+    ftp_client_t *client = (ftp_client_t *)arg;
+    
+    if (!client) {
+        // No client context, close connection
+        if (p) pbuf_free(p);
+        tcp_close(tpcb);
+        return ERR_ARG;
     }
-
-    ftp_session_t *session = &server->session;
-
-    if (session->ctrl_sock < 0) {
-        struct sockaddr_in client_addr;
-        socklen_t addr_len = sizeof(client_addr);
-
-        int new_sock = lwip_accept(server->listen_sock,
-                                   (struct sockaddr *)&client_addr,
-                                   &addr_len);
-        if (new_sock >= 0) {
-            session->ctrl_sock = new_sock;
-            session->client_addr.addr = client_addr.sin_addr.s_addr;
-            session->client_port = ntohs(client_addr.sin_port);
-            session->last_activity_ms = to_ms_since_boot(get_absolute_time());
-
-            char ip_str[16];
-            inet_ntoa_r(client_addr.sin_addr, ip_str, sizeof(ip_str));
-            printf("FTP: New connection from %s:%d\n", ip_str, session->client_port);
-
-            ftp_send_response(session, 220, "--- Welcome to Pico 2 W FTP Server ---");
-        }
-        return;
+    
+    // Connection closed by client
+    if (p == NULL) {
+        printf("FTP: Connection closed by client\n");
+        ftp_close_client(client);
+        return ERR_OK;
     }
-
-    char buffer[256];
-    int bytes = lwip_recv(session->ctrl_sock, buffer,
-                          sizeof(buffer) - 1, MSG_DONTWAIT);
-
-    if (bytes > 0) {
-        session->last_activity_ms = to_ms_since_boot(get_absolute_time());
-
-        for (int i = 0; i < bytes; i++) {
-            char c = buffer[i];
-
-            if (c == '\n') {
-                session->cmd_buffer[session->cmd_len] = '\0';
-                ftp_trim(session->cmd_buffer);
-
-                if (session->cmd_len > 0) {
-                    ftp_process_command(server, session);
-                }
-                session->cmd_len = 0;
-            } else if (c >= 32 && c < 127) {
-                if (session->cmd_len < FTP_CMD_BUFFER_SIZE - 1) {
-                    session->cmd_buffer[session->cmd_len++] = c;
-                }
+    
+    // Process received data
+    if (p->tot_len > 0) {
+        // Copy data to command buffer
+        uint16_t available = sizeof(client->cmd_buffer) - client->cmd_len - 1;
+        uint16_t to_copy = (p->tot_len < available) ? p->tot_len : available;
+        
+        pbuf_copy_partial(p, client->cmd_buffer + client->cmd_len, to_copy, 0);
+        client->cmd_len += to_copy;
+        client->cmd_buffer[client->cmd_len] = '\0';
+        
+        // Tell TCP we processed the data
+        cyw43_arch_lwip_begin();
+        tcp_recved(tpcb, p->tot_len);
+        cyw43_arch_lwip_end();
+        
+        // Process complete commands (ending with \n)
+        char *line_start = client->cmd_buffer;
+        char *line_end;
+        
+        while ((line_end = strchr(line_start, '\n')) != NULL) {
+            // Found complete command
+            *line_end = '\0';
+            
+            if (strlen(line_start) > 0) {
+                ftp_process_command(client, line_start);
             }
+            
+            // Move to next command
+            line_start = line_end + 1;
         }
-    } else if (bytes == 0) {
-        ftp_close_session(session);
+        
+        // Move remaining incomplete command to start of buffer
+        if (line_start > client->cmd_buffer) {
+            size_t remaining = strlen(line_start);
+            memmove(client->cmd_buffer, line_start, remaining + 1);
+            client->cmd_len = remaining;
+        }
     }
+    
+    pbuf_free(p);
+    return ERR_OK;
+}
 
-    uint32_t now = to_ms_since_boot(get_absolute_time());
-    if (session->ctrl_sock >= 0 &&
-        (now - session->last_activity_ms) > FTP_TIMEOUT_MS) {
-        printf("FTP: Client timeout\n");
-        ftp_send_response(session, 421, "Timeout.");
-        ftp_close_session(session);
+/**
+ * TCP error callback
+ */
+static void ftp_error(void *arg, err_t err) {
+    ftp_client_t *client = (ftp_client_t *)arg;
+    printf("FTP: TCP error %d\n", err);
+    
+    if (client) {
+        client->pcb = NULL; // PCB already freed by lwIP
+        client->active = false;
     }
 }
 
-void ftp_server_stop(ftp_server_t *server) {
-    if (!server) {
+/**
+ * Close client connection
+ */
+static void ftp_close_client(ftp_client_t *client) {
+    if (!client || !client->active) {
         return;
     }
-
-    ftp_close_session(&server->session);
-
-    if (server->listen_sock >= 0) {
-        lwip_close(server->listen_sock);
-        server->listen_sock = -1;
+    
+    printf("FTP: Closing client connection\n");
+    
+    if (client->pcb) {
+        cyw43_arch_lwip_begin();
+        tcp_arg(client->pcb, NULL);
+        tcp_recv(client->pcb, NULL);
+        tcp_err(client->pcb, NULL);
+        tcp_close(client->pcb);
+        cyw43_arch_lwip_end();
+        client->pcb = NULL;
     }
+    
+    // Reset client state
+    client->state = FTP_STATE_IDLE;
+    client->cmd_len = 0;
+    client->cmd_buffer[0] = '\0';
+    client->username[0] = '\0';
+    client->active = false;
+}
 
+/**
+ * TCP accept callback - called when new client connects
+ */
+static err_t ftp_accept(void *arg, struct tcp_pcb *newpcb, err_t err) {
+    LWIP_UNUSED_ARG(arg);
+    
+    if (err != ERR_OK || newpcb == NULL) {
+        printf("FTP: Accept error\n");
+        return ERR_VAL;
+    }
+    
+    // Find free client slot
+    ftp_client_t *client = NULL;
+    for (int i = 0; i < FTP_MAX_CLIENTS; i++) {
+        if (!ftp_clients[i].active) {
+            client = &ftp_clients[i];
+            break;
+        }
+    }
+    
+    if (!client) {
+        printf("FTP: Max clients reached, rejecting connection\n");
+        tcp_close(newpcb);
+        return ERR_MEM;
+    }
+    
+    // Initialize client
+    memset(client, 0, sizeof(ftp_client_t));
+    client->pcb = newpcb;
+    client->state = FTP_STATE_IDLE;
+    client->active = true;
+    
+    printf("FTP: Client connected from %s\n", ipaddr_ntoa(&newpcb->remote_ip));
+    
+    // Set up callbacks
+    tcp_arg(newpcb, client);
+    tcp_recv(newpcb, ftp_recv);
+    tcp_err(newpcb, ftp_error);
+    
+    // Send welcome message
+    ftp_send_response(client, FTP_RESP_220_WELCOME);
+    
+    return ERR_OK;
+}
+
+/**
+ * Initialize and start FTP server
+ */
+bool ftp_server_init(void) {
+    printf("FTP: Initializing server on port %d\n", FTP_PORT);
+    
+    // Initialize client array
+    memset(ftp_clients, 0, sizeof(ftp_clients));
+    
+    // Create new TCP PCB
+    cyw43_arch_lwip_begin();
+    ftp_server_pcb = tcp_new();
+    cyw43_arch_lwip_end();
+    
+    if (!ftp_server_pcb) {
+        printf("FTP: Failed to create PCB\n");
+        return false;
+    }
+    
+    // Bind to FTP port
+    err_t err;
+    cyw43_arch_lwip_begin();
+    err = tcp_bind(ftp_server_pcb, IP_ADDR_ANY, FTP_PORT);
+    cyw43_arch_lwip_end();
+    
+    if (err != ERR_OK) {
+        printf("FTP: Bind failed, err=%d\n", err);
+        cyw43_arch_lwip_begin();
+        tcp_close(ftp_server_pcb);
+        cyw43_arch_lwip_end();
+        ftp_server_pcb = NULL;
+        return false;
+    }
+    
+    // Start listening
+    cyw43_arch_lwip_begin();
+    ftp_server_pcb = tcp_listen(ftp_server_pcb);
+    cyw43_arch_lwip_end();
+    
+    if (!ftp_server_pcb) {
+        printf("FTP: Listen failed\n");
+        return false;
+    }
+    
+    // Set accept callback
+    cyw43_arch_lwip_begin();
+    tcp_accept(ftp_server_pcb, ftp_accept);
+    cyw43_arch_lwip_end();
+    
+    printf("FTP: Server started successfully\n");
+    printf("FTP: Username: %s\n", FTP_USER);
+    printf("FTP: Password: %s\n", FTP_PASSWORD);
+    
+    return true;
+}
+
+/**
+ * FTP Server main loop (called from ftp_server_application_task)
+ */
+void ftp_server_process(void) {
+    // In raw lwIP, all processing is done via callbacks
+    // This function is just a placeholder for future expansion
+    // (e.g., periodic cleanup, statistics, etc.)
+    
+    // For now, just yield to allow callbacks to run
+    vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+/**
+ * Shutdown FTP server
+ */
+void ftp_server_shutdown(void) {
+    printf("FTP: Shutting down server\n");
+    
+    // Close all client connections
+    for (int i = 0; i < FTP_MAX_CLIENTS; i++) {
+        if (ftp_clients[i].active) {
+            ftp_close_client(&ftp_clients[i]);
+        }
+    }
+    
+    // Close server PCB
+    if (ftp_server_pcb) {
+        cyw43_arch_lwip_begin();
+        tcp_close(ftp_server_pcb);
+        cyw43_arch_lwip_end();
+        ftp_server_pcb = NULL;
+    }
+    
     printf("FTP: Server stopped\n");
 }
-
-bool ftp_server_has_client(const ftp_server_t *server) {
-    return server && server->session.ctrl_sock >= 0;
-}
-
