@@ -5,7 +5,6 @@
 
 #include <stdio.h>
 #include <stdbool.h>
-#include "pico/mutex.h"
 #include "hardware/watchdog.h"  // For BOOT_FLAG_ADDR (watchdog_hw->scratch)
 
 //      Pin name    GPIO    Direction   Comment     Description
@@ -71,13 +70,6 @@ void monitor_button_for_mode_switch(uint32_t current_mode);
 void signal_interrupt_to_amiga(void);  // Signal Amiga before mode switch
 
 // ============================================================================
-// Synchronization
-// ============================================================================
-
-// Note: spi_mutex is only used by FatFS library (diskio.c) for SD card access
-extern mutex_t spi_mutex;
-
-// ============================================================================
 // Work Functions
 // ============================================================================
 
@@ -87,8 +79,9 @@ void par_spi_main(void);
 
 // FTP Server Functions (defined in ftp_server.c)
 // Runs in BOOT_MODE_FREERTOS
-bool ftp_server_init(void);      // Initialize FTP server (call after WiFi connected)
-void ftp_server_process(void);   // Process FTP server (call in loop)
-void ftp_server_shutdown(void);  // Shutdown FTP server
+// Note: FATFS is defined in ff.h - include it in your implementation
+bool ftp_server_init(void *fs);        // Initialize FTP server with FatFS filesystem (pass FATFS*)
+void ftp_server_process(void);         // Process FTP server (call in loop)
+void ftp_server_shutdown(void);        // Shutdown FTP server
 
 #endif // MAIN_H

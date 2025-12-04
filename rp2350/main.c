@@ -9,6 +9,11 @@
 #include <FreeRTOS.h>
 #include <task.h>
 #include <lwip/netif.h>
+#include "ff.h"
+#include "hardware/spi.h"
+
+static FATFS g_fatfs;
+static bool g_sd_mounted = false;
 
 // Signal interrupt to Amiga before mode switch
 // Sends single short IRQ pulse to notify Amiga that card state will change
@@ -106,17 +111,79 @@ void launch_bare_metal_mode() {
 // FREERTOS MODE (Uses WiFi/FTP/RAW LWIP API)
 // -----------------------------------------------------------
 
-// Updated ftp_server_application_task for main.c
-// Replace the existing function with this version
-
+// This version initializes SPI, mounts SD card, and starts FTP server
 void ftp_server_application_task(void *pvParameters) {
     printf("FTP Task: Starting on Core %d\n", get_core_num());
     
     // Brief delay to ensure WiFi is fully ready
     vTaskDelay(pdMS_TO_TICKS(1000));
     
-    // Initialize FTP server
-    if (!ftp_server_init()) {
+    // ========================================================================
+    // Initialize SPI hardware for SD card access
+    // ========================================================================
+    printf("FTP Task: Initializing SPI for SD card...\n");
+    
+    // Initialize SPI0 at slow speed initially (for SD card initialization)
+    spi_init(spi0, SPI_SLOW_FREQUENCY);
+    
+    // Set SPI format: 8 bits, CPOL=0, CPHA=0, MSB first
+    spi_set_format(spi0, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    
+    // Initialize GPIO pins for SPI
+    gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);  // MISO
+    gpio_set_function(PIN_SCK,  GPIO_FUNC_SPI);  // SCK
+    gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);  // MOSI
+    
+    // Initialize SS (Chip Select) as GPIO output (not SPI function)
+    gpio_init(PIN_SS);
+    gpio_set_dir(PIN_SS, GPIO_OUT);
+    gpio_put(PIN_SS, 1);  // Deselect (active low)
+    
+    // Add pull-up to MISO (SD card data out)
+    gpio_pull_up(PIN_MISO);
+    
+    printf("FTP Task: SPI initialized successfully\n");
+    
+    // ========================================================================
+    // Mount SD card
+    // ========================================================================
+    printf("FTP Task: Mounting SD card...\n");
+    FRESULT res = f_mount(&g_fatfs, "", 1);  // 1 = mount now
+    
+    if (res != FR_OK) {
+        printf("FTP Task: Failed to mount SD card, error=%d\n", res);
+        printf("FTP Task: Possible causes:\n");
+        printf("  - No SD card inserted\n");
+        printf("  - Card not formatted as FAT32\n");
+        printf("  - Hardware connection issue\n");
+        
+        // Continue without SD card - FTP will fail but won't crash
+        while (1) {
+            monitor_button_for_mode_switch(BOOT_MODE_FREERTOS);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+    
+    g_sd_mounted = true;
+    printf("FTP Task: SD card mounted successfully\n");
+    
+    // Get filesystem info
+    DWORD fre_clust, fre_sect, tot_sect;
+    FATFS *fs_ptr;
+    
+    res = f_getfree("", &fre_clust, &fs_ptr);
+    if (res == FR_OK) {
+        tot_sect = (fs_ptr->n_fatent - 2) * fs_ptr->csize;
+        fre_sect = fre_clust * fs_ptr->csize;
+        
+        printf("FTP Task: Total space: %lu KB\n", tot_sect / 2);
+        printf("FTP Task: Free space:  %lu KB\n", fre_sect / 2);
+    }
+    
+    // ========================================================================
+    // Initialize FTP server with filesystem
+    // ========================================================================
+    if (!ftp_server_init(&g_fatfs)) {
         printf("FTP Task: Failed to initialize FTP server!\n");
         // Stay in loop but don't process
         while (1) {
@@ -126,6 +193,7 @@ void ftp_server_application_task(void *pvParameters) {
     }
     
     printf("FTP Task: FTP server ready for connections\n");
+    printf("FTP Task: Connect to FTP and browse SD card contents\n");
     
     // Main FTP server loop
     while (1) {
@@ -137,6 +205,15 @@ void ftp_server_application_task(void *pvParameters) {
         
         // Small delay
         vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// Optional: Add cleanup function to unmount on mode switch
+void ftp_cleanup(void) {
+    if (g_sd_mounted) {
+        f_unmount("");
+        g_sd_mounted = false;
+        printf("FTP: SD card unmounted\n");
     }
 }
 
