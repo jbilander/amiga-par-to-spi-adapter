@@ -1,23 +1,24 @@
 /**
  * ftp_server.c - Enhanced FTP Server using raw lwIP API
  * 
- * VERSION: 2024-12-05-v9 (Fall through to close after complete!)
+ * VERSION: 2024-12-05-v10 (Added FEAT and SIZE commands)
  * 
  * Features:
  * - PASV (passive mode) support
  * - LIST/NLST (directory listing) commands
  * - RETR (file download) with RAM buffering
- * - MDTM (modification time) command
+ * - MDTM (modification time query)
+ * - SIZE (file size query)
+ * - FEAT (feature negotiation - RFC 2389)
  * - CWD/CDUP (directory navigation)
  * - Non-blocking event-driven architecture
  * - RAM buffering for efficient transfers (up to 256KB)
- * - Check len > 0 for real ACKs
- * - Fall through to close connection after setting transfer_complete
+ * - Proper lwIP callback handling with ACK detection
  * 
  * Integrates with FatFS for SD card access.
  * Uses raw lwIP API (not BSD sockets) with cyw43_arch_lwip_begin/end protection.
  * 
- * CRITICAL: After setting transfer_complete, fall through to close connection!
+ * CRITICAL: Check len > 0 in tcp_sent for real ACKs, fall through to close on complete
  */
 
 #include "main.h"
@@ -43,7 +44,9 @@
 // FTP Response Codes
 #define FTP_RESP_150_OPENING_DATA   "150 Opening data connection\r\n"
 #define FTP_RESP_200_TYPE_OK        "200 Type set to I\r\n"
-#define FTP_RESP_214_HELP           "214 Help: USER PASS QUIT SYST PWD TYPE PASV LIST NLST CWD CDUP RETR MDTM\r\n"
+#define FTP_RESP_211_FEAT_START     "211-Features:\r\n"
+#define FTP_RESP_211_FEAT_END       "211 End\r\n"
+#define FTP_RESP_214_HELP           "214 Help: USER PASS QUIT SYST PWD TYPE PASV LIST NLST CWD CDUP RETR MDTM SIZE FEAT\r\n"
 #define FTP_RESP_215_SYSTEM         "215 UNIX Type: L8\r\n"
 #define FTP_RESP_220_WELCOME        "220 Pico FTP Server ready\r\n"
 #define FTP_RESP_221_GOODBYE        "221 Goodbye\r\n"
@@ -898,6 +901,30 @@ static void ftp_cmd_retr(ftp_client_t *client, const char *arg) {
 }
 
 /**
+ * Handle FEAT command - Feature negotiation (RFC 2389)
+ * Returns list of supported extensions so clients know what's available
+ */
+static void ftp_cmd_feat(ftp_client_t *client) {
+    printf("FTP: FEAT command received\n");
+    
+    // Send multi-line response (format: 211-Features: ... 211 End)
+    ftp_send_response(client, FTP_RESP_211_FEAT_START);
+    
+    // List supported features (one per line, starting with space)
+    ftp_send_response(client, " MDTM\r\n");           // Modification time query
+    ftp_send_response(client, " SIZE\r\n");           // File size query
+    ftp_send_response(client, " PASV\r\n");           // Passive mode
+    ftp_send_response(client, " REST STREAM\r\n");    // Resume transfer
+    // TODO: Add when implemented:
+    // ftp_send_response(client, " MFMT\r\n");        // Modify file modification time
+    // ftp_send_response(client, " MLST type*;size*;modify*;\r\n"); // Machine listing
+    // ftp_send_response(client, " MLSD\r\n");        // Machine listing directory
+    
+    // End features list
+    ftp_send_response(client, FTP_RESP_211_FEAT_END);
+}
+
+/**
  * Handle MDTM command - get file modification time
  */
 static void ftp_cmd_mdtm(ftp_client_t *client, const char *arg) {
@@ -959,6 +986,47 @@ static void ftp_cmd_mdtm(ftp_client_t *client, const char *arg) {
     
     printf("FTP: MDTM %s -> %04d-%02d-%02d %02d:%02d:%02d\n", 
            filepath, year, month, day, hour, minute, second);
+    
+    ftp_send_response(client, response);
+}
+
+/**
+ * Handle SIZE command - get file size in bytes
+ */
+static void ftp_cmd_size(ftp_client_t *client, const char *arg) {
+    if (!arg || strlen(arg) == 0) {
+        ftp_send_response(client, "501 Syntax error: filename required\r\n");
+        return;
+    }
+    
+    // Build full file path
+    char filepath[512];
+    if (arg[0] == '/') {
+        strncpy(filepath, arg, sizeof(filepath) - 1);
+    } else {
+        snprintf(filepath, sizeof(filepath), "%s/%s", client->cwd, arg);
+    }
+    filepath[sizeof(filepath) - 1] = '\0';
+    
+    // Get file info using f_stat
+    FILINFO fno;
+    FRESULT res = f_stat(filepath, &fno);
+    
+    if (res != FR_OK) {
+        ftp_send_response(client, "550 File not found\r\n");
+        return;
+    }
+    
+    if (fno.fattrib & AM_DIR) {
+        ftp_send_response(client, "550 Is a directory\r\n");
+        return;
+    }
+    
+    // Send response: 213 <size>
+    char response[64];
+    snprintf(response, sizeof(response), "213 %lu\r\n", (unsigned long)fno.fsize);
+    
+    printf("FTP: SIZE %s = %lu bytes\n", filepath, (unsigned long)fno.fsize);
     
     ftp_send_response(client, response);
 }
@@ -1059,6 +1127,12 @@ static void ftp_process_command(ftp_client_t *client, char *cmd) {
     }
     else if (strcmp(cmd, "MDTM") == 0) {
         ftp_cmd_mdtm(client, arg);
+    }
+    else if (strcmp(cmd, "SIZE") == 0) {
+        ftp_cmd_size(client, arg);
+    }
+    else if (strcmp(cmd, "FEAT") == 0) {
+        ftp_cmd_feat(client);
     }
     else if (strcmp(cmd, "HELP") == 0) {
         ftp_send_response(client, FTP_RESP_214_HELP);
