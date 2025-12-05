@@ -1,6 +1,6 @@
 /*
  * par_spi.c - Amiga SPI Bridge (Bare Metal Mode)
- * VERSION: 2024-12-02-WATCHDOG-REBOOT
+ * VERSION: 2025-12-02-WATCHDOG-REBOOT
  * 
  * Originally based on Niklas Ekström's October 2022 RP2040 version
  * Adapted for jbilander's Pico 2 W hardware with watchdog-based mode switching
