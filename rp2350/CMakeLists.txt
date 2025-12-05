@@ -58,9 +58,8 @@ target_include_directories(fatfs PUBLIC
 add_executable(${PROJECT}
     main.c
     par_spi.c
-#    ftp_utils.c
+    ftp_utils.c
     ftp_server.c
-#    util.c
 )
 
 pico_generate_pio_header(${PROJECT} ${CMAKE_CURRENT_LIST_DIR}/act_mirror.pio)
@@ -92,8 +91,6 @@ target_link_libraries(${PROJECT}
     FreeRTOS-Kernel
     FreeRTOS-Kernel-Heap4
     pico_cyw43_arch_lwip_threadsafe_background
-#    pico_cyw43_arch_lwip_sys_freertos
-#    pico_cyw43_arch_lwip_poll
 )
 
 pico_add_extra_outputs(${PROJECT})

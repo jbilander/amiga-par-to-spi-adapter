@@ -88,6 +88,7 @@ ftp_command_t ftp_parse_command(const char *cmd_str) {
         {"RETR", FTP_CMD_RETR}, {"STOR", FTP_CMD_STOR}, {"DELE", FTP_CMD_DELE},
         {"MKD",  FTP_CMD_MKD},  {"RMD",  FTP_CMD_RMD},  {"RNFR", FTP_CMD_RNFR},
         {"RNTO", FTP_CMD_RNTO}, {"ABOR", FTP_CMD_ABOR}, {"OPTS", FTP_CMD_OPTS},
+        {"MDTM", FTP_CMD_MDTM}, {"SIZE", FTP_CMD_SIZE}, 
         {"MFMT", FTP_CMD_MFMT}, {"MFCT", FTP_CMD_MFCT},
         {"XMKD", FTP_CMD_XMKD}, {"XRMD", FTP_CMD_XRMD},
         {NULL, FTP_CMD_NONE}
@@ -104,8 +105,8 @@ ftp_command_t ftp_parse_command(const char *cmd_str) {
 
 const char *ftp_month_str(uint8_t month) {
     static const char *months[] = {
-        "ERR", "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
-        "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"
+        "ERR", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
     };
     return (month >= 1 && month <= 12) ? months[month] : months[0];
 }
@@ -125,7 +126,7 @@ void ftp_path_change(ftp_path_t *path, const char *new_path) {
     size_t N = sizeof(temp);
 
     if (new_path[0] == '/') {
-        // Absolute path — clamp to buffer
+        // Absolute path - clamp to buffer
         snprintf(temp, N, "%.*s", (int)(N - 1), new_path);
     } else {
         // Relative path
@@ -224,4 +225,3 @@ void ftp_path_normalize(char *path) {
         strcpy(path, "/");
     }
 }
-

@@ -1,36 +1,74 @@
-/* ftp_types.h - FTP server types and constants for Pico 2 W */
+/**
+ * ftp_types.h - Type definitions and constants for raw lwIP FTP server
+ * 
+ * Part of Pico 2 W FTP Server using raw lwIP API
+ * Non-blocking event-driven architecture with FatFS integration
+ */
 
 #ifndef FTP_TYPES_H
 #define FTP_TYPES_H
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "lwip/ip_addr.h"
+#include "lwip/tcp.h"
+#include "ff.h"  // FatFS
 
 // ============================================================================
 // FTP Protocol Constants
 // ============================================================================
 
-#define FTP_CTRL_PORT           21      // Standard FTP control port
-#define FTP_DATA_PORT_MIN       50000   // Passive mode port range start
-#define FTP_DATA_PORT_MAX       50010   // Passive mode port range end
+#define FTP_PORT                21          // Standard FTP control port
+#define FTP_DATA_PORT_MIN       50000       // Passive mode port range start
+#define FTP_DATA_PORT_MAX       50010       // Passive mode port range end
 
-#define FTP_CMD_BUFFER_SIZE     256     // Maximum FTP command line length
-#define FTP_PATH_MAX_LEN        255     // Maximum path length
-#define FTP_FILENAME_MAX        255     // Maximum filename length
-#define FTP_USERNAME_MAX        32      // Maximum username length
-#define FTP_PASSWORD_MAX        32      // Maximum password length
-#define FTP_RESPONSE_MAX        256     // Maximum response line length
+#define FTP_CMD_BUFFER_SIZE     256         // Maximum FTP command line length
+#define FTP_PATH_MAX_LEN        256         // Maximum path length
+#define FTP_FILENAME_MAX        256         // Maximum filename length
+#define FTP_USERNAME_MAX        32          // Maximum username length
+#define FTP_PASSWORD_MAX        32          // Maximum password length
 
-#define FTP_TRANSFER_BUFFER     4096    // File transfer buffer size (4KB)
+#define FTP_MAX_CLIENTS         2           // Maximum simultaneous clients
 
-#define FTP_TIMEOUT_MS          300000  // 5 minute timeout (300000ms)
-#define FTP_MAX_USERS           4       // Maximum number of users
+#define FTP_FILE_BUFFER_MAX     (256*1024)  // 256KB max RAM buffer per transfer
 
 // ============================================================================
-// FTP Commands (Enum)
+// FTP Response Code Strings
 // ============================================================================
 
+#define FTP_RESP_150_OPENING_DATA   "150 Opening data connection\r\n"
+#define FTP_RESP_200_TYPE_OK        "200 Type set to I\r\n"
+#define FTP_RESP_211_FEAT_START     "211-Features:\r\n"
+#define FTP_RESP_211_FEAT_END       "211 End\r\n"
+#define FTP_RESP_214_HELP           "214 Help: USER PASS QUIT SYST PWD TYPE PASV LIST NLST CWD CDUP RETR MDTM SIZE FEAT\r\n"
+#define FTP_RESP_215_SYSTEM         "215 UNIX Type: L8\r\n"
+#define FTP_RESP_220_WELCOME        "220 Pico FTP Server ready\r\n"
+#define FTP_RESP_221_GOODBYE        "221 Goodbye\r\n"
+#define FTP_RESP_226_TRANSFER_OK    "226 Transfer complete\r\n"
+#define FTP_RESP_230_LOGIN_OK       "230 User logged in\r\n"
+#define FTP_RESP_250_FILE_OK        "250 File action okay\r\n"
+#define FTP_RESP_257_PWD            "257 \"%s\" is current directory\r\n"
+#define FTP_RESP_331_USER_OK        "331 User name okay, need password\r\n"
+#define FTP_RESP_500_UNKNOWN        "500 Unknown command\r\n"
+#define FTP_RESP_502_NOT_IMPL       "502 Command not implemented\r\n"
+#define FTP_RESP_530_LOGIN_FAILED   "530 Login incorrect\r\n"
+#define FTP_RESP_550_FILE_ERROR     "550 File/directory error\r\n"
+
+// ============================================================================
+// FTP Client State Machine
+// ============================================================================
+
+/**
+ * FTP path structure
+ * Used for working directory management
+ */
+typedef struct {
+    char path[FTP_PATH_MAX_LEN];    // Current working directory
+} ftp_path_t;
+
+/**
+ * FTP command enumeration
+ * Used by ftp_parse_command() in ftp_utils.c
+ */
 typedef enum {
     FTP_CMD_NONE = 0,
     FTP_CMD_USER,       // Username for authentication
@@ -57,132 +95,76 @@ typedef enum {
     FTP_CMD_RNTO,       // Rename to
     FTP_CMD_ABOR,       // Abort transfer
     FTP_CMD_OPTS,       // Set options
+    FTP_CMD_MDTM,       // Get file modification time
+    FTP_CMD_SIZE,       // Get file size
     FTP_CMD_MFMT,       // Modify file modification time
     FTP_CMD_MFCT,       // Modify file creation time
     FTP_CMD_XMKD,       // Make directory (alternative)
     FTP_CMD_XRMD,       // Remove directory (alternative)
 } ftp_command_t;
 
-// ============================================================================
-// FTP Client State Machine
-// ============================================================================
-
+/**
+ * Client authentication state
+ */
 typedef enum {
-    FTP_STATE_IDLE,         // Waiting for USER command
-    FTP_STATE_USER,         // Username received, waiting for PASS
-    FTP_STATE_AUTHENTICATED // Authenticated, ready for commands
-} ftp_client_state_t;
+    FTP_STATE_IDLE = 0,         // Initial state, waiting for USER
+    FTP_STATE_USER_OK,          // USER received, waiting for PASS
+    FTP_STATE_LOGGED_IN         // Authenticated and ready for commands
+} ftp_state_t;
 
 // ============================================================================
-// FTP Transfer Type
+// FTP Data Connection Structure
 // ============================================================================
 
-typedef enum {
-    FTP_TYPE_ASCII,         // ASCII mode (with CRLF conversion)
-    FTP_TYPE_BINARY         // Binary mode (no conversion)
-} ftp_transfer_type_t;
+/**
+ * Data connection state (for PASV mode file transfers)
+ * Manages the separate TCP connection used for data transfer
+ */
+typedef struct ftp_data_conn {
+    struct tcp_pcb *listen_pcb;             // Listening PCB for PASV mode
+    struct tcp_pcb *pcb;                    // Active data connection PCB
+    uint16_t port;                          // Port we're listening on (PASV)
+    volatile bool waiting_for_connection;   // True when waiting for client to connect
+    volatile bool connected;                // True when data connection established
+    volatile bool transfer_complete;        // True when transfer done, ready to close
+} ftp_data_conn_t;
 
 // ============================================================================
-// FTP Data Connection Mode
+// FTP Client Structure
 // ============================================================================
 
-typedef enum {
-    FTP_DATA_MODE_NONE,     // No data connection established
-    FTP_DATA_MODE_PASSIVE,  // Passive mode (PASV) - we listen
-    FTP_DATA_MODE_ACTIVE    // Active mode (PORT) - we connect
-} ftp_data_mode_t;
-
-// ============================================================================
-// FTP Transfer State
-// ============================================================================
-
-typedef enum {
-    FTP_TRANSFER_NONE,      // No transfer in progress
-    FTP_TRANSFER_LIST,      // Sending directory listing
-    FTP_TRANSFER_RETR,      // Sending file (download)
-    FTP_TRANSFER_STOR       // Receiving file (upload)
-} ftp_transfer_state_t;
-
-// ============================================================================
-// FTP User Structure
-// ============================================================================
-
-typedef struct {
-    char username[FTP_USERNAME_MAX];
-    char password[FTP_PASSWORD_MAX];
-} ftp_user_t;
-
-// ============================================================================
-// FTP Path Structure
-// ============================================================================
-
-typedef struct {
-    char path[FTP_PATH_MAX_LEN];    // Current working directory
-} ftp_path_t;
-
-// ============================================================================
-// FTP Session Structure (one client)
-// ============================================================================
-
-typedef struct {
+/**
+ * FTP client session structure
+ * Represents one connected FTP client with control and data connections
+ */
+typedef struct ftp_client {
     // Control connection
-    int ctrl_sock;                      // Control socket (-1 if not connected)
-    ip_addr_t client_addr;              // Client IP address
-    uint16_t client_port;               // Client port
+    struct tcp_pcb *pcb;                    // Control connection PCB
+    ftp_state_t state;                      // Authentication state
+    char cmd_buffer[FTP_CMD_BUFFER_SIZE];   // Incoming command buffer
+    uint16_t cmd_len;                       // Current command length
+    char username[FTP_USERNAME_MAX];        // Username for authentication
+    char cwd[FTP_PATH_MAX_LEN];             // Current working directory
+    bool active;                            // Connection active flag
     
-    // State machine
-    ftp_client_state_t state;           // Current authentication state
-    char username[FTP_USERNAME_MAX];    // Username being authenticated
+    // Data connection
+    ftp_data_conn_t data_conn;              // Data connection state
     
-    // Working directory
-    ftp_path_t cwd;                     // Current working directory
+    // Pending operations (waiting for data connection)
+    bool pending_list;                      // LIST command pending
+    bool pending_retr;                      // RETR command pending
+    char retr_filename[FTP_FILENAME_MAX];   // Filename for pending RETR
     
-    // Transfer settings
-    ftp_transfer_type_t transfer_type;  // ASCII or Binary
-    ftp_data_mode_t data_mode;          // Passive or Active
+    // File transfer state
+    FIL retr_file;                          // FatFS file handle for RETR
+    bool retr_file_open;                    // True if file is open
+    uint32_t retr_bytes_sent;               // Total bytes sent in transfer
     
-    // Data connection (passive mode)
-    int data_listen_sock;               // Passive mode listening socket
-    int data_sock;                      // Active data connection socket
-    uint16_t pasv_port;                 // Port we're listening on (passive)
-    
-    // Data connection (active mode)
-    ip_addr_t active_client_addr;       // Client IP for active mode
-    uint16_t active_client_port;        // Client port for active mode
-    
-    // Transfer state
-    ftp_transfer_state_t transfer_state; // Current transfer operation
-    void *transfer_context;             // Transfer-specific context (e.g., FIL*)
-    
-    // Command parsing
-    char cmd_buffer[FTP_CMD_BUFFER_SIZE]; // Incoming command buffer
-    uint16_t cmd_len;                   // Current command length
-    
-    // Rename operation (RNFR/RNTO)
-    bool rename_from_set;               // RNFR command received
-    char rename_from[FTP_PATH_MAX_LEN]; // Source path for rename
-    
-    // Timeout tracking
-    uint32_t last_activity_ms;          // Last activity timestamp
-} ftp_session_t;
-
-// ============================================================================
-// FTP Server Structure
-// ============================================================================
-
-typedef struct {
-    // Listening socket
-    int listen_sock;                    // Control connection listening socket
-    
-    // User database
-    ftp_user_t users[FTP_MAX_USERS];    // User credentials
-    uint8_t user_count;                 // Number of users configured
-    
-    // Session (single client support)
-    ftp_session_t session;              // Active client session
-    
-    // Passive port allocation
-    uint16_t next_pasv_port;            // Next passive port to try
-} ftp_server_t;
+    // RAM buffering for efficient transfers
+    uint8_t *file_buffer;                   // RAM buffer for file data
+    uint32_t file_buffer_size;              // Total bytes in buffer
+    uint32_t file_buffer_pos;               // Current send position in buffer
+    bool sending_in_progress;               // Re-entry guard for callbacks
+} ftp_client_t;
 
 #endif // FTP_TYPES_H

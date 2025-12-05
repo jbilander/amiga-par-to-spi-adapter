@@ -21,7 +21,8 @@
  * CRITICAL: Check len > 0 in tcp_sent for real ACKs, fall through to close on complete
  */
 
-#include "main.h"
+#include "ftp_server.h"
+#include "ftp_types.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -31,75 +32,10 @@
 #include <lwip/ip_addr.h>
 #include <FreeRTOS.h>
 #include <task.h>
-#include "ff.h"  // FatFS
 
 // FTP Server Configuration
-#define FTP_PORT        21
-#define FTP_DATA_PORT_MIN  50000
-#define FTP_DATA_PORT_MAX  50010
 #define FTP_USER        "pico"
 #define FTP_PASSWORD    "pico"
-#define FTP_MAX_CLIENTS 2
-
-// FTP Response Codes
-#define FTP_RESP_150_OPENING_DATA   "150 Opening data connection\r\n"
-#define FTP_RESP_200_TYPE_OK        "200 Type set to I\r\n"
-#define FTP_RESP_211_FEAT_START     "211-Features:\r\n"
-#define FTP_RESP_211_FEAT_END       "211 End\r\n"
-#define FTP_RESP_214_HELP           "214 Help: USER PASS QUIT SYST PWD TYPE PASV LIST NLST CWD CDUP RETR MDTM SIZE FEAT\r\n"
-#define FTP_RESP_215_SYSTEM         "215 UNIX Type: L8\r\n"
-#define FTP_RESP_220_WELCOME        "220 Pico FTP Server ready\r\n"
-#define FTP_RESP_221_GOODBYE        "221 Goodbye\r\n"
-#define FTP_RESP_226_TRANSFER_OK    "226 Transfer complete\r\n"
-#define FTP_RESP_230_LOGIN_OK       "230 User logged in\r\n"
-#define FTP_RESP_250_FILE_OK        "250 File action okay\r\n"
-#define FTP_RESP_257_PWD            "257 \"%s\" is current directory\r\n"
-#define FTP_RESP_331_USER_OK        "331 User name okay, need password\r\n"
-#define FTP_RESP_500_UNKNOWN        "500 Unknown command\r\n"
-#define FTP_RESP_502_NOT_IMPL       "502 Command not implemented\r\n"
-#define FTP_RESP_530_LOGIN_FAILED   "530 Login incorrect\r\n"
-#define FTP_RESP_550_FILE_ERROR     "550 File/directory error\r\n"
-
-// Client Connection State
-typedef enum {
-    FTP_STATE_IDLE = 0,
-    FTP_STATE_USER_OK,
-    FTP_STATE_LOGGED_IN
-} ftp_state_t;
-
-// Data Connection State
-typedef struct ftp_data_conn {
-    struct tcp_pcb *listen_pcb;    // Listening for PASV connection
-    struct tcp_pcb *pcb;           // Active data connection
-    uint16_t port;                 // Port for PASV
-    volatile bool waiting_for_connection;   // True when waiting for client to connect
-    volatile bool connected;                // True when data connection established
-    volatile bool transfer_complete;        // True when data transfer is done and connection should close
-} ftp_data_conn_t;
-
-// Client Control Connection
-typedef struct ftp_client {
-    struct tcp_pcb *pcb;           // Control connection PCB
-    ftp_state_t state;             // Authentication state
-    char cmd_buffer[256];          // Command buffer
-    uint16_t cmd_len;              // Current command length
-    char username[32];             // Username provided by client
-    char cwd[256];                 // Current working directory
-    ftp_data_conn_t data_conn;     // Data connection info
-    bool active;                   // Connection active flag
-    bool pending_list;             // True if LIST is pending data connection
-    bool pending_retr;             // True if RETR (download) is pending
-    char retr_filename[256];       // Filename for pending RETR
-    FIL retr_file;                 // FatFS file handle for RETR
-    bool retr_file_open;           // True if retr_file is open
-    uint32_t retr_bytes_sent;      // Bytes sent in current RETR transfer
-    
-    // RAM buffer for efficient file transfers
-    uint8_t *file_buffer;          // Dynamically allocated buffer for file data
-    uint32_t file_buffer_size;     // Total size of data in buffer
-    uint32_t file_buffer_pos;      // Current position in buffer (bytes sent)
-    bool sending_in_progress;      // Prevent re-entry in ftp_send_file_chunk
-} ftp_client_t;
 
 // Global FTP Server State
 static struct tcp_pcb *ftp_server_pcb = NULL;
@@ -107,20 +43,22 @@ static ftp_client_t ftp_clients[FTP_MAX_CLIENTS];
 static uint16_t next_data_port = FTP_DATA_PORT_MIN;
 static FATFS *g_fs = NULL;  // FatFS filesystem
 
-// Forward declarations
+// Forward declarations for internal static functions
 static err_t ftp_accept(void *arg, struct tcp_pcb *newpcb, err_t err);
 static err_t ftp_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err);
 static void ftp_error(void *arg, err_t err);
 static void ftp_close_client(ftp_client_t *client);
 static void ftp_close_data_connection(ftp_client_t *client);
-static void ftp_send_list(ftp_client_t *client);  // Forward declaration for LIST handler
-static void ftp_start_file_transfer(ftp_client_t *client, const char *filepath);  // RETR transfer
-static void ftp_send_file_chunk(ftp_client_t *client);  // Send next file chunk
-
-// Data connection forward declarations
+static void ftp_send_list(ftp_client_t *client);
+static void ftp_start_file_transfer(ftp_client_t *client, const char *filepath);
+static void ftp_send_file_chunk(ftp_client_t *client);
 static err_t ftp_data_accept(void *arg, struct tcp_pcb *newpcb, err_t err);
 static err_t ftp_data_sent(void *arg, struct tcp_pcb *tpcb, u16_t len);
 static void ftp_data_error(void *arg, err_t err);
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
 
 /**
  * Send FTP response to client
@@ -1286,7 +1224,7 @@ static err_t ftp_accept(void *arg, struct tcp_pcb *newpcb, err_t err) {
 /**
  * Initialize FTP server with FatFS
  */
-bool ftp_server_init(void *fs) {
+bool ftp_server_init(FATFS *fs) {
     printf("FTP: Initializing server on port %d\n", FTP_PORT);
     
     if (!fs) {
@@ -1294,7 +1232,7 @@ bool ftp_server_init(void *fs) {
         return false;
     }
     
-    g_fs = (FATFS *)fs;  // Cast from void* to FATFS*
+    g_fs = fs;  // Store filesystem pointer
     memset(ftp_clients, 0, sizeof(ftp_clients));
     
     cyw43_arch_lwip_begin();
