@@ -167,6 +167,17 @@ void ftp_server_application_task(void *pvParameters) {
     g_sd_mounted = true;
     printf("FTP Task: SD card mounted successfully\n");
     
+    // ========================================================================
+    // CRITICAL: Switch SD card to FAST SPI speed for normal operations
+    // ========================================================================
+    printf("FTP Task: Setting SD card to fast SPI speed...\n");
+    uint actual = spi_set_baudrate(spi0, SPI_FAST_FREQUENCY);
+    printf("FTP Task: SPI speed set to %u Hz (requested %u Hz)\n", actual, SPI_FAST_FREQUENCY);
+    
+    if (actual < 1000000) {
+        printf("FTP Task: WARNING - SPI speed unusually low! Check hardware.\n");
+    }
+    
     // Get filesystem info
     DWORD fre_clust, fre_sect, tot_sect;
     FATFS *fs_ptr;

@@ -39,7 +39,7 @@
 #define FTP_RESP_200_TYPE_OK        "200 Type set to I\r\n"
 #define FTP_RESP_211_FEAT_START     "211-Features:\r\n"
 #define FTP_RESP_211_FEAT_END       "211 End\r\n"
-#define FTP_RESP_214_HELP           "214 Help: USER PASS QUIT SYST PWD TYPE PASV LIST NLST CWD CDUP RETR MDTM SIZE FEAT\r\n"
+#define FTP_RESP_214_HELP           "214 Help: USER PASS QUIT SYST PWD TYPE PASV LIST MLSD NLST CWD CDUP RETR MDTM SIZE FEAT\r\n"
 #define FTP_RESP_215_SYSTEM         "215 UNIX Type: L8\r\n"
 #define FTP_RESP_220_WELCOME        "220 Pico FTP Server ready\r\n"
 #define FTP_RESP_221_GOODBYE        "221 Goodbye\r\n"
@@ -152,6 +152,7 @@ typedef struct ftp_client {
     
     // Pending operations (waiting for data connection)
     bool pending_list;                      // LIST command pending
+    bool pending_mlsd;                      // MLSD command pending
     bool pending_retr;                      // RETR command pending
     char retr_filename[FTP_FILENAME_MAX];   // Filename for pending RETR
     
@@ -162,8 +163,10 @@ typedef struct ftp_client {
     
     // RAM buffering for efficient transfers
     uint8_t *file_buffer;                   // RAM buffer for file data
-    uint32_t file_buffer_size;              // Total bytes in buffer
-    uint32_t file_buffer_pos;               // Current send position in buffer
+    uint32_t file_buffer_size;              // Total file size (or buffer size for small files)
+    uint32_t file_buffer_pos;               // Current file position (total bytes sent)
+    uint32_t buffer_data_len;               // Streaming: valid data currently in buffer
+    uint32_t buffer_send_pos;               // Streaming: current send position in buffer
     bool sending_in_progress;               // Re-entry guard for callbacks
 } ftp_client_t;
 
