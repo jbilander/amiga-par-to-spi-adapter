@@ -7,7 +7,7 @@
  * - PASV (passive mode) support
  * - LIST/NLST (directory listing) commands
  * - MLSD (machine-readable directory listing - RFC 3659)
- * - RETR (file download) with RAM buffering
+ * - RETR (file download) with RAM buffering and streaming mode
  * - MDTM (modification time query)
  * - SIZE (file size query)
  * - FEAT (feature negotiation - RFC 2389)
@@ -33,6 +33,16 @@
 #include <lwip/ip_addr.h>
 #include <FreeRTOS.h>
 #include <task.h>
+
+#ifndef FTP_DEBUG
+#define FTP_DEBUG 0
+#endif
+
+#if FTP_DEBUG
+#define FTP_LOG(...) printf(__VA_ARGS__)
+#else
+#define FTP_LOG(...)
+#endif
 
 // FTP Server Configuration
 #define FTP_USER        "pico"
@@ -111,7 +121,7 @@ static err_t ftp_send_response(ftp_client_t *client, const char *response) {
     cyw43_arch_lwip_end();
     
     if (err != ERR_OK) {
-        printf("FTP: Failed to send response, err=%d\n", err);
+        FTP_LOG("FTP: Failed to send response, err=%d\n", err);
     }
     
     return err;
@@ -170,7 +180,7 @@ static void ftp_close_data_connection(ftp_client_t *client) {
     if (client->retr_file_open) {
         f_close(&client->retr_file);
         client->retr_file_open = false;
-        printf("FTP: Closed open file handle\n");
+        FTP_LOG("FTP: Closed open file handle\n");
     }
     
     // Free RAM buffer if allocated
@@ -179,7 +189,7 @@ static void ftp_close_data_connection(ftp_client_t *client) {
         client->file_buffer = NULL;
         client->file_buffer_size = 0;
         client->file_buffer_pos = 0;
-        printf("FTP: Freed file buffer\n");
+        FTP_LOG("FTP: Freed file buffer\n");
     }
     
     client->data_conn.waiting_for_connection = false;
@@ -226,9 +236,8 @@ static err_t ftp_data_sent(void *arg, struct tcp_pcb *tpcb, u16_t len) {
             return ERR_OK;  // More data to send, return and wait for next ACK
         } else {
             // All data has been sent and ACKed!
-            printf("FTP: File transfer complete, %lu bytes sent and ACKed\n", 
+            FTP_LOG("FTP: File transfer complete, %lu bytes sent and ACKed\n", 
                    client->file_buffer_pos);
-            fflush(stdout);
             client->data_conn.transfer_complete = true;
             
             // Don't return - fall through to close connection immediately
@@ -238,7 +247,7 @@ static err_t ftp_data_sent(void *arg, struct tcp_pcb *tpcb, u16_t len) {
     // Check if transfer is complete and all data sent
     if (client->data_conn.transfer_complete && client->data_conn.pcb &&
         tcp_sndbuf(client->data_conn.pcb) == TCP_SND_BUF) {
-        printf("FTP Data: All data transmitted, closing connection\n");
+        FTP_LOG("FTP Data: All data transmitted, closing connection\n");
         
         client->data_conn.transfer_complete = false;
         
@@ -257,7 +266,7 @@ static err_t ftp_data_sent(void *arg, struct tcp_pcb *tpcb, u16_t len) {
  */
 static void ftp_data_error(void *arg, err_t err) {
     ftp_client_t *client = (ftp_client_t *)arg;
-    printf("FTP Data: Connection error %d\n", err);
+    FTP_LOG("FTP Data: Connection error %d\n", err);
     
     if (client) {
         client->data_conn.pcb = NULL;  // PCB already freed
@@ -272,11 +281,11 @@ static err_t ftp_data_accept(void *arg, struct tcp_pcb *newpcb, err_t err) {
     ftp_client_t *client = (ftp_client_t *)arg;
     
     if (err != ERR_OK || !newpcb || !client) {
-        printf("FTP Data: Accept error (err=%d, newpcb=%p, client=%p)\n", err, newpcb, client);
+        FTP_LOG("FTP Data: Accept error (err=%d, newpcb=%p, client=%p)\n", err, newpcb, client);
         return ERR_VAL;
     }
     
-    printf("FTP Data: Client connected from %s\n", ipaddr_ntoa(&newpcb->remote_ip));
+    FTP_LOG("FTP Data: Client connected from %s\n", ipaddr_ntoa(&newpcb->remote_ip));
     
     // Set up data connection
     client->data_conn.pcb = newpcb;
@@ -289,7 +298,7 @@ static err_t ftp_data_accept(void *arg, struct tcp_pcb *newpcb, err_t err) {
     
     // Close the listening PCB - we only accept one data connection
     if (client->data_conn.listen_pcb) {
-        printf("FTP Data: Closing listen socket\n");
+        FTP_LOG("FTP Data: Closing listen socket\n");
         cyw43_arch_lwip_begin();
         tcp_close(client->data_conn.listen_pcb);
         cyw43_arch_lwip_end();
@@ -298,24 +307,21 @@ static err_t ftp_data_accept(void *arg, struct tcp_pcb *newpcb, err_t err) {
     
     // Handle pending LIST operation
     if (client->pending_list) {
-        printf("FTP Data: Pending LIST detected, sending directory listing\n");
-        fflush(stdout);
+        FTP_LOG("FTP Data: Pending LIST detected, sending directory listing\n");
         client->pending_list = false;
         ftp_send_list(client);
     }
     
     // Handle pending MLSD operation
     if (client->pending_mlsd) {
-        printf("FTP Data: Pending MLSD detected, sending machine-readable listing\n");
-        fflush(stdout);
+        FTP_LOG("FTP Data: Pending MLSD detected, sending machine-readable listing\n");
         client->pending_mlsd = false;
         ftp_send_mlsd(client);
     }
     
     // Handle pending RETR operation
     if (client->pending_retr) {
-        printf("FTP Data: Pending RETR detected, starting file transfer\n");
-        fflush(stdout);
+        FTP_LOG("FTP Data: Pending RETR detected, starting file transfer\n");
         client->pending_retr = false;
         ftp_start_file_transfer(client, client->retr_filename);
     }
@@ -327,14 +333,14 @@ static err_t ftp_data_accept(void *arg, struct tcp_pcb *newpcb, err_t err) {
  * Handle PASV command - enter passive mode
  */
 static void ftp_cmd_pasv(ftp_client_t *client) {
-    printf("FTP: PASV command received\n");
+    FTP_LOG("FTP: PASV command received\n");
     
     // Close any existing data connection
     ftp_close_data_connection(client);
     
     // Get next available port
     uint16_t port = ftp_get_next_data_port();
-    printf("FTP: PASV - attempting to bind port %d\n", port);
+    FTP_LOG("FTP: PASV - attempting to bind port %d\n", port);
     
     // Create new listening PCB for data connection
     cyw43_arch_lwip_begin();
@@ -342,7 +348,7 @@ static void ftp_cmd_pasv(ftp_client_t *client) {
     cyw43_arch_lwip_end();
     
     if (!listen_pcb) {
-        printf("FTP: PASV - failed to create data PCB\n");
+        FTP_LOG("FTP: PASV - failed to create data PCB\n");
         ftp_send_response(client, "425 Can't open data connection\r\n");
         return;
     }
@@ -354,7 +360,7 @@ static void ftp_cmd_pasv(ftp_client_t *client) {
     cyw43_arch_lwip_end();
     
     if (err != ERR_OK) {
-        printf("FTP: PASV - failed to bind data port %d, err=%d\n", port, err);
+        FTP_LOG("FTP: PASV - failed to bind data port %d, err=%d\n", port, err);
         cyw43_arch_lwip_begin();
         tcp_close(listen_pcb);
         cyw43_arch_lwip_end();
@@ -362,7 +368,7 @@ static void ftp_cmd_pasv(ftp_client_t *client) {
         return;
     }
     
-    printf("FTP: PASV - bound to port %d successfully\n", port);
+    FTP_LOG("FTP: PASV - bound to port %d successfully\n", port);
     
     // Start listening with explicit backlog
     cyw43_arch_lwip_begin();
@@ -370,7 +376,7 @@ static void ftp_cmd_pasv(ftp_client_t *client) {
     cyw43_arch_lwip_end();
     
     if (!new_listen_pcb) {
-        printf("FTP: PASV - failed to listen on data port\n");
+        FTP_LOG("FTP: PASV - failed to listen on data port\n");
         cyw43_arch_lwip_begin();
         tcp_close(listen_pcb);
         cyw43_arch_lwip_end();
@@ -379,7 +385,7 @@ static void ftp_cmd_pasv(ftp_client_t *client) {
     }
     
     listen_pcb = new_listen_pcb;
-    printf("FTP: PASV - listening on port %d with backlog=1\n", port);
+    FTP_LOG("FTP: PASV - listening on port %d with backlog=1\n", port);
     
     // Set accept callback
     cyw43_arch_lwip_begin();
@@ -407,9 +413,9 @@ static void ftp_cmd_pasv(ftp_client_t *client) {
              "227 Entering Passive Mode (%d,%d,%d,%d,%d,%d)\r\n",
              ip[0], ip[1], ip[2], ip[3], p1, p2);
     
-    printf("FTP: PASV - sending response: %s", response);
+    FTP_LOG("FTP: PASV - sending response: %s", response);
     ftp_send_response(client, response);
-    printf("FTP: PASV - waiting for client to connect on port %d\n", port);
+    FTP_LOG("FTP: PASV - waiting for client to connect on port %d\n", port);
 }
 
 /**
@@ -429,7 +435,7 @@ static void ftp_send_list(ftp_client_t *client) {
     FRESULT res = f_opendir(&dir, client->cwd);
     
     if (res != FR_OK) {
-        printf("FTP: Failed to open directory '%s', err=%d\n", client->cwd, res);
+        FTP_LOG("FTP: Failed to open directory '%s', err=%d\n", client->cwd, res);
         ftp_send_response(client, FTP_RESP_550_FILE_ERROR);
         ftp_close_data_connection(client);
         return;
@@ -497,10 +503,10 @@ static void ftp_send_list(ftp_client_t *client) {
             } else if (err == ERR_MEM) {
                 // Buffer full - flush and stop for now
                 // lwIP will send what's queued
-                printf("FTP: Send buffer full at %d bytes, flushing\n", total_sent);
+                FTP_LOG("FTP: Send buffer full at %d bytes, flushing\n", total_sent);
                 break;
             } else {
-                printf("FTP: Data write error %d\n", err);
+                FTP_LOG("FTP: Data write error %d\n", err);
                 break;
             }
         }
@@ -508,7 +514,7 @@ static void ftp_send_list(ftp_client_t *client) {
     
     f_closedir(&dir);
     
-    printf("FTP: LIST queued %d bytes for sending\n", total_sent);
+    FTP_LOG("FTP: LIST queued %d bytes for sending\n", total_sent);
     
     // Flush all queued data
     cyw43_arch_lwip_begin();
@@ -520,22 +526,22 @@ static void ftp_send_list(ftp_client_t *client) {
     
     // Don't close immediately - let lwIP transmit the data
     // The tcp_sent callback will close the connection and send 226 when all data is ACKed
-    printf("FTP: Data queued, waiting for transmission to complete\n");
+    FTP_LOG("FTP: Data queued, waiting for transmission to complete\n");
 }
 
-/**
- * Send next chunk of file data
- */
 /**
  * Send next chunk of file data from RAM buffer / streaming buffer
  */
 static void ftp_send_file_chunk(ftp_client_t *client) {
     if (!client->file_buffer || !client->data_conn.connected || !client->data_conn.pcb) {
+        FTP_LOG("FTP: Send chunk skipped: buffer=%p, connected=%d, pcb=%p\n",
+               client->file_buffer, client->data_conn.connected, client->data_conn.pcb);
         return;
     }
     
-    // CRITICAL: Prevent re-entry!
+    // Prevent re-entry
     if (client->sending_in_progress) {
+        FTP_LOG("FTP: Send already in progress, skipping nested call\n");
         return;
     }
     
@@ -543,18 +549,17 @@ static void ftp_send_file_chunk(ftp_client_t *client) {
     
     // Check if all data has been sent
     if (client->file_buffer_pos >= client->file_buffer_size) {
-        // All data sent!
-        printf("FTP: File transfer complete, %lu bytes sent\n", client->file_buffer_pos);
-        fflush(stdout);
+        // All data sent
+        FTP_LOG("FTP: File transfer complete, %lu bytes queued\n", client->file_buffer_pos);
         
-        // Close file if streaming
+        // In streaming mode, close file now since we're done
         if (client->retr_file_open) {
             f_close(&client->retr_file);
             client->retr_file_open = false;
-            printf("FTP: Closed file after streaming\n");
+            FTP_LOG("FTP: Closed file after streaming\n");
         }
         
-        // Mark transfer as complete
+        // Mark transfer as complete; tcp_sent() will close and send 226 after ACKs
         client->data_conn.transfer_complete = true;
         
         // Flush any buffered data
@@ -563,28 +568,34 @@ static void ftp_send_file_chunk(ftp_client_t *client) {
         cyw43_arch_lwip_end();
         
         client->sending_in_progress = false;
-        
-        // tcp_sent callback will close connection and send 226
         return;
     }
     
-    // Get available TCP send buffer space
+    // Check TCP send buffer availability
     uint16_t available = tcp_sndbuf(client->data_conn.pcb);
-    
     if (available == 0) {
+        FTP_LOG("FTP: No TCP send buffer available, deferring send\n");
         client->sending_in_progress = false;
         return;
     }
     
-    // Streaming mode: manage buffer and SD card reads
+    // There are two modes:
+    // 1. RAM buffer mode - file was fully loaded into memory (small files)
+    // 2. Streaming mode - file is being read in chunks (large files)
+    
     if (client->retr_file_open) {
-        // Check if buffer needs refilling
+        // STREAMING MODE
+        FTP_LOG("FTP: Streaming mode, buffer_pos=%lu, data_len=%lu, file_pos=%lu/%lu\n",
+               client->buffer_send_pos, client->buffer_data_len,
+               client->file_buffer_pos, client->file_buffer_size);
+        
+        // Refill buffer from file if needed
         if (client->buffer_send_pos >= client->buffer_data_len) {
-            // Before reading from SD, verify connection is still alive
+            FTP_LOG("FTP: Buffer empty, reading next chunk from file\n");
+            
+            // Verify connection is still alive before reading from SD
             if (!client->data_conn.connected || !client->data_conn.pcb) {
-                // Client disconnected, stop reading
-                printf("FTP: Client disconnected during streaming, aborting\n");
-                fflush(stdout);
+                FTP_LOG("FTP: Client disconnected during streaming, aborting\n");
                 if (client->retr_file_open) {
                     f_close(&client->retr_file);
                     client->retr_file_open = false;
@@ -593,27 +604,32 @@ static void ftp_send_file_chunk(ftp_client_t *client) {
                 return;
             }
             
-            // Buffer is empty - read next chunk from SD card
+            // Calculate remaining bytes in file
             uint32_t remaining_file = client->file_buffer_size - client->file_buffer_pos;
-            uint32_t to_read = (remaining_file > FTP_STREAM_BUFFER_SIZE)
-                                   ? FTP_STREAM_BUFFER_SIZE
-                                   : remaining_file;
+            if (remaining_file == 0) {
+                FTP_LOG("FTP: No more file data to stream\n");
+                client->sending_in_progress = false;
+                return;
+            }
             
-            // Read minimum half-buffer chunks for efficiency (except at end of file)
+            // Decide how much to read into our streaming buffer
+            uint32_t to_read = (remaining_file > FTP_STREAM_BUFFER_SIZE)
+                               ? FTP_STREAM_BUFFER_SIZE
+                               : remaining_file;
+            
+            // Try to read at least half-buffer chunks when possible (except near EOF)
             if (to_read > (FTP_STREAM_BUFFER_SIZE / 2) && to_read < FTP_STREAM_BUFFER_SIZE) {
                 to_read = FTP_STREAM_BUFFER_SIZE / 2;
             }
             
-            printf("FTP: Buffer empty, reading %lu bytes from SD (file pos %lu/%lu)\n",
-                   to_read, client->file_buffer_pos, client->file_buffer_size);
-            fflush(stdout);
+            FTP_LOG("FTP: Reading %lu bytes from SD at file pos %lu\n",
+                   to_read, client->file_buffer_pos);
             
             UINT bytes_read = 0;
             FRESULT res = f_read(&client->retr_file, client->file_buffer, to_read, &bytes_read);
             
             if (res != FR_OK) {
-                printf("FTP: File read error %d\n", res);
-                fflush(stdout);
+                FTP_LOG("FTP: File read error %d\n", res);
                 client->sending_in_progress = false;
                 if (client->retr_file_open) {
                     f_close(&client->retr_file);
@@ -624,43 +640,44 @@ static void ftp_send_file_chunk(ftp_client_t *client) {
                 return;
             }
             
+            // Update streaming buffer tracking
             client->buffer_data_len = bytes_read;
             client->buffer_send_pos = 0;
-            printf("FTP: Loaded %u bytes into buffer\n", bytes_read);
-            fflush(stdout);
+            FTP_LOG("FTP: Loaded %u bytes into streaming buffer\n", bytes_read);
             
             if (bytes_read == 0) {
-                // Shouldn't happen but handle gracefully
-                printf("FTP: No data read from file\n");
+                // Shouldn't happen unless near EOF, but handle gracefully
+                FTP_LOG("FTP: No data read from file, possible EOF\n");
                 client->sending_in_progress = false;
                 return;
             }
         }
         
-        // Send from buffer
+        // Send from streaming buffer
         uint32_t buffer_available = client->buffer_data_len - client->buffer_send_pos;
         uint16_t tcp_available = tcp_sndbuf(client->data_conn.pcb);
-        
         if (tcp_available == 0) {
+            FTP_LOG("FTP: TCP buffer empty in streaming send, deferring\n");
             client->sending_in_progress = false;
             return;
         }
         
-        // Determine chunk size to send:
-        // - At most half the current TCP send buffer
-        // - Capped at FTP_MAX_CHUNK_SIZE
+        // Limit chunk to half the available send buffer, capped at FTP_MAX_CHUNK_SIZE
         uint16_t max_chunk = tcp_available / 2;
         if (max_chunk > FTP_MAX_CHUNK_SIZE) {
             max_chunk = FTP_MAX_CHUNK_SIZE;
         }
         if (max_chunk == 0) {
+            FTP_LOG("FTP: max_chunk == 0, cannot send\n");
             client->sending_in_progress = false;
             return;
         }
         
         uint16_t chunk_size = (buffer_available > max_chunk) ? max_chunk : buffer_available;
         
-        // Send chunk from buffer
+        FTP_LOG("FTP: Streaming chunk: size=%u, buffer_pos=%lu, file_pos=%lu\n",
+               chunk_size, client->buffer_send_pos, client->file_buffer_pos);
+        
         err_t err;
         cyw43_arch_lwip_begin();
         err = tcp_write(client->data_conn.pcb,
@@ -673,10 +690,12 @@ static void ftp_send_file_chunk(ftp_client_t *client) {
             client->buffer_send_pos += chunk_size;
             client->file_buffer_pos += chunk_size;
             client->retr_bytes_sent += chunk_size;
-        } else if (err != ERR_MEM) {
-            // Only log actual errors, not buffer full
-            printf("FTP: TCP write error %d\n", err);
-            fflush(stdout);
+            FTP_LOG("FTP: Streaming sent %u bytes, file_pos=%lu\n",
+                   chunk_size, client->file_buffer_pos);
+        } else if (err == ERR_MEM) {
+            FTP_LOG("FTP: ERR_MEM during streaming write, will retry later\n");
+        } else {
+            FTP_LOG("FTP: TCP write error %d during streaming\n", err);
             if (client->retr_file_open) {
                 f_close(&client->retr_file);
                 client->retr_file_open = false;
@@ -689,48 +708,53 @@ static void ftp_send_file_chunk(ftp_client_t *client) {
         return;
     }
     
-    // RAM buffer mode: send from existing buffer
+    // RAM BUFFER MODE
+    // For small files fully loaded into memory
+    
     uint32_t remaining = client->file_buffer_size - client->file_buffer_pos;
     
-    // Use at most half the available TCP send buffer, capped at FTP_MAX_CHUNK_SIZE
+    // Limit chunk to half the available send buffer, capped at FTP_MAX_CHUNK_SIZE
     uint16_t max_chunk = available / 2;
     if (max_chunk > FTP_MAX_CHUNK_SIZE) {
         max_chunk = FTP_MAX_CHUNK_SIZE;
     }
     if (max_chunk == 0) {
+        FTP_LOG("FTP: max_chunk == 0 in RAM mode, cannot send\n");
         client->sending_in_progress = false;
         return;
     }
     
     uint16_t chunk_size = (remaining > max_chunk) ? max_chunk : remaining;
-    
     if (chunk_size == 0) {
+        FTP_LOG("FTP: No data remaining to send in RAM mode\n");
         client->sending_in_progress = false;
         return;
     }
     
-    // Send chunk from RAM buffer
+    FTP_LOG("FTP: RAM chunk: size=%u, file_pos=%lu/%lu, sndbuf=%u\n",
+           chunk_size, client->file_buffer_pos, client->file_buffer_size, available);
+    
     err_t err;
     cyw43_arch_lwip_begin();
-    err = tcp_write(client->data_conn.pcb, 
-                    client->file_buffer + client->file_buffer_pos, 
-                    chunk_size, 
+    err = tcp_write(client->data_conn.pcb,
+                    client->file_buffer + client->file_buffer_pos,
+                    chunk_size,
                     TCP_WRITE_FLAG_COPY);
     cyw43_arch_lwip_end();
     
     if (err == ERR_OK) {
-        // Data queued successfully
         client->file_buffer_pos += chunk_size;
         client->retr_bytes_sent += chunk_size;
-    } else if (err != ERR_MEM) {
-        // Only log actual errors, not buffer full
-        printf("FTP: TCP write error %d\n", err);
-        fflush(stdout);
+        FTP_LOG("FTP: RAM mode sent %u bytes, new pos=%lu\n",
+               chunk_size, client->file_buffer_pos);
+    } else if (err == ERR_MEM) {
+        FTP_LOG("FTP: ERR_MEM in RAM mode, will retry later\n");
+    } else {
+        FTP_LOG("FTP: TCP write error %d in RAM mode\n", err);
         ftp_close_data_connection(client);
         ftp_send_response(client, "426 Transfer aborted: write error\r\n");
     }
     
-    // Clear the sending flag - we're done with this iteration
     client->sending_in_progress = false;
 }
 
@@ -739,13 +763,13 @@ static void ftp_send_file_chunk(ftp_client_t *client) {
  * Loads entire file into RAM for efficient transfer or streams with buffer
  */
 static void ftp_start_file_transfer(ftp_client_t *client, const char *filepath) {
-    printf("FTP: Starting file transfer: %s\n", filepath);
+    FTP_LOG("FTP: Starting file transfer: %s\n", filepath);
     
     // Open file for reading
     FIL file;
     FRESULT res = f_open(&file, filepath, FA_READ);
     if (res != FR_OK) {
-        printf("FTP: Failed to open file '%s', err=%d\n", filepath, res);
+        FTP_LOG("FTP: Failed to open file '%s', err=%d\n", filepath, res);
         ftp_send_response(client, "550 Failed to open file\r\n");
         ftp_close_data_connection(client);
         return;
@@ -753,7 +777,7 @@ static void ftp_start_file_transfer(ftp_client_t *client, const char *filepath) 
     
     // Get file size
     uint32_t file_size = f_size(&file);
-    printf("FTP: File size: %lu bytes\n", file_size);
+    FTP_LOG("FTP: File size: %lu bytes\n", file_size);
     
     // Strategy:
     // - Small files (<= 256KB): Load into RAM, close file (fast)
@@ -762,12 +786,12 @@ static void ftp_start_file_transfer(ftp_client_t *client, const char *filepath) 
     
     if (use_streaming) {
         // Large file - use streaming mode
-        printf("FTP: Large file (%lu bytes), using streaming mode\n", file_size);
+        FTP_LOG("FTP: Large file (%lu bytes), using streaming mode\n", file_size);
         
-        // Allocate streaming buffer
-        client->file_buffer = (uint8_t *)malloc(FTP_STREAM_BUFFER_SIZE);
+        // Allocate streaming buffer for large file transfers
+        client->file_buffer = (uint8_t *)malloc(FTP_STREAM_BUFFER_SIZE);  // Streaming buffer
         if (!client->file_buffer) {
-            printf("FTP: Failed to allocate streaming buffer\n");
+            FTP_LOG("FTP: Failed to allocate streaming buffer\n");
             f_close(&file);
             ftp_send_response(client, "451 Out of memory\r\n");
             ftp_close_data_connection(client);
@@ -785,12 +809,12 @@ static void ftp_start_file_transfer(ftp_client_t *client, const char *filepath) 
         
     } else {
         // Small file - load entirely into RAM
-        printf("FTP: Small file (%lu bytes), loading into RAM\n", file_size);
+        FTP_LOG("FTP: Small file (%lu bytes), loading into RAM\n", file_size);
         
         // Allocate RAM buffer for entire file
         client->file_buffer = (uint8_t *)malloc(file_size);
         if (!client->file_buffer) {
-            printf("FTP: Failed to allocate %lu bytes for file buffer\n", file_size);
+            FTP_LOG("FTP: Failed to allocate %lu bytes for file buffer\n", file_size);
             f_close(&file);
             ftp_send_response(client, "451 Out of memory\r\n");
             ftp_close_data_connection(client);
@@ -803,7 +827,7 @@ static void ftp_start_file_transfer(ftp_client_t *client, const char *filepath) 
         f_close(&file);  // Close file immediately after reading
         
         if (res2 != FR_OK || bytes_read != file_size) {
-            printf("FTP: File read error %d, got %u bytes\n", res2, bytes_read);
+            FTP_LOG("FTP: File read error %d, got %u bytes\n", res2, bytes_read);
             free(client->file_buffer);
             client->file_buffer = NULL;
             ftp_send_response(client, "451 Read error\r\n");
@@ -811,7 +835,7 @@ static void ftp_start_file_transfer(ftp_client_t *client, const char *filepath) 
             return;
         }
         
-        printf("FTP: Loaded %u bytes into RAM buffer\n", bytes_read);
+        FTP_LOG("FTP: Loaded %u bytes into RAM buffer\n", bytes_read);
         
         // Initialize transfer state
         client->file_buffer_size = bytes_read;
@@ -822,27 +846,23 @@ static void ftp_start_file_transfer(ftp_client_t *client, const char *filepath) 
         client->buffer_send_pos = 0;     // Not used in RAM mode
     }
     
-    printf("FTP: Initialized: buffer_size=%lu, buffer_pos=%lu, retr_bytes_sent=%lu\n",
+    FTP_LOG("FTP: Initialized: buffer_size=%lu, buffer_pos=%lu, retr_bytes_sent=%lu\n",
            client->file_buffer_size, client->file_buffer_pos, client->retr_bytes_sent);
-    fflush(stdout);
     
     // Send 150 response
     ftp_send_response(client, "150 Opening data connection\r\n");
     
-    printf("FTP: About to call ftp_send_file_chunk()\n");
-    fflush(stdout);
+    FTP_LOG("FTP: About to call ftp_send_file_chunk()\n");
     
     // Start sending
     ftp_send_file_chunk(client);
     
-    // CRITICAL: Flush the initial chunk to start transmission
-    // Without this, data stays queued and never transmits
+    // Flush the initial chunk to start transmission
     if (client->data_conn.pcb) {
         cyw43_arch_lwip_begin();
         tcp_output(client->data_conn.pcb);
         cyw43_arch_lwip_end();
-        printf("FTP: Initial chunk flushed, transmission started\n");
-        fflush(stdout);
+        FTP_LOG("FTP: Initial chunk flushed, transmission started\n");
     }
 }
 
@@ -852,39 +872,30 @@ static void ftp_start_file_transfer(ftp_client_t *client, const char *filepath) 
 static void ftp_cmd_list(ftp_client_t *client, const char *arg) {
     LWIP_UNUSED_ARG(arg);  // For now, ignore argument (always list CWD)
     
-    printf("FTP: LIST command received\n");
-    printf("FTP: LIST - waiting_for_connection=%d, connected=%d\n", 
+    FTP_LOG("FTP: LIST command received\n");
+    FTP_LOG("FTP: LIST - waiting_for_connection=%d, connected=%d\n", 
            client->data_conn.waiting_for_connection, 
            client->data_conn.connected);
-    fflush(stdout);
     
     if (!client->data_conn.waiting_for_connection && !client->data_conn.connected) {
-        printf("FTP: LIST - ERROR: No PASV mode active\n");
-        fflush(stdout);
+        FTP_LOG("FTP: LIST - ERROR: No PASV mode active\n");
         ftp_send_response(client, "425 Use PASV first\r\n");
         return;
     }
     
     // If already connected, send immediately
     if (client->data_conn.connected) {
-        printf("FTP: LIST - Data connection already established, sending listing\n");
-        fflush(stdout);
+        FTP_LOG("FTP: LIST - Data connection already established, sending listing\n");
         ftp_send_list(client);
         return;
     }
     
     // If waiting for connection, mark LIST as pending and return
-    // The listing will be sent when data connection is accepted
-    printf("FTP: LIST - Data connection pending, marking LIST for later\n");
-    fflush(stdout);
+    FTP_LOG("FTP: LIST - Data connection pending, marking LIST for later\n");
     
     client->pending_list = true;
     
-    printf("FTP: LIST - Returning from handler, will send listing when connection arrives\n");
-    fflush(stdout);
-    
-    // DON'T WAIT - just return! The accept callback will send the listing
-    // Note: 150 response will be sent by ftp_send_list when connection is ready
+    FTP_LOG("FTP: LIST - Returning from handler, will send listing when connection arrives\n");
 }
 
 /**
@@ -906,7 +917,7 @@ static void ftp_send_mlsd(ftp_client_t *client) {
     FRESULT res = f_opendir(&dir, client->cwd);
     
     if (res != FR_OK) {
-        printf("FTP: Failed to open directory '%s', err=%d\n", client->cwd, res);
+        FTP_LOG("FTP: Failed to open directory '%s', err=%d\n", client->cwd, res);
         ftp_send_response(client, FTP_RESP_550_FILE_ERROR);
         ftp_close_data_connection(client);
         return;
@@ -941,8 +952,7 @@ static void ftp_send_mlsd(ftp_client_t *client) {
                           year, month, day, hour, minute, second,
                           fno.fname);
         
-        // Debug: Print what we're sending
-        printf("MLSD: %s", line);
+        FTP_LOG("MLSD: %s", line);
         
         if (len > 0 && len < (int)sizeof(line)) {
             // Send line over data connection
@@ -954,10 +964,10 @@ static void ftp_send_mlsd(ftp_client_t *client) {
             if (err == ERR_OK) {
                 total_sent += len;
             } else if (err == ERR_MEM) {
-                printf("FTP: Send buffer full at %d bytes, flushing\n", total_sent);
+                FTP_LOG("FTP: Send buffer full at %d bytes, flushing\n", total_sent);
                 break;
             } else {
-                printf("FTP: Data write error %d\n", err);
+                FTP_LOG("FTP: Data write error %d\n", err);
                 break;
             }
         }
@@ -965,7 +975,7 @@ static void ftp_send_mlsd(ftp_client_t *client) {
     
     f_closedir(&dir);
     
-    printf("FTP: MLSD queued %d bytes for sending\n", total_sent);
+    FTP_LOG("FTP: MLSD queued %d bytes for sending\n", total_sent);
     
     // Flush all queued data
     cyw43_arch_lwip_begin();
@@ -975,7 +985,7 @@ static void ftp_send_mlsd(ftp_client_t *client) {
     // Mark transfer as complete
     client->data_conn.transfer_complete = true;
     
-    printf("FTP: MLSD data queued, waiting for transmission to complete\n");
+    FTP_LOG("FTP: MLSD data queued, waiting for transmission to complete\n");
 }
 
 /**
@@ -985,35 +995,30 @@ static void ftp_send_mlsd(ftp_client_t *client) {
 static void ftp_cmd_mlsd(ftp_client_t *client, const char *arg) {
     LWIP_UNUSED_ARG(arg);  // For now, ignore argument (always list CWD)
     
-    printf("FTP: MLSD command received\n");
-    printf("FTP: MLSD - waiting_for_connection=%d, connected=%d\n", 
+    FTP_LOG("FTP: MLSD command received\n");
+    FTP_LOG("FTP: MLSD - waiting_for_connection=%d, connected=%d\n", 
            client->data_conn.waiting_for_connection, 
            client->data_conn.connected);
-    fflush(stdout);
     
     if (!client->data_conn.waiting_for_connection && !client->data_conn.connected) {
-        printf("FTP: MLSD - ERROR: No PASV mode active\n");
-        fflush(stdout);
+        FTP_LOG("FTP: MLSD - ERROR: No PASV mode active\n");
         ftp_send_response(client, "425 Use PASV first\r\n");
         return;
     }
     
     // If already connected, send immediately
     if (client->data_conn.connected) {
-        printf("FTP: MLSD - Data connection already established, sending listing\n");
-        fflush(stdout);
+        FTP_LOG("FTP: MLSD - Data connection already established, sending listing\n");
         ftp_send_mlsd(client);
         return;
     }
     
     // If waiting for connection, mark MLSD as pending
-    printf("FTP: MLSD - Data connection pending, marking MLSD for later\n");
-    fflush(stdout);
+    FTP_LOG("FTP: MLSD - Data connection pending, marking MLSD for later\n");
     
     client->pending_mlsd = true;
     
-    printf("FTP: MLSD - Returning from handler, will send listing when connection arrives\n");
-    fflush(stdout);
+    FTP_LOG("FTP: MLSD - Returning from handler, will send listing when connection arrives\n");
 }
 
 /**
@@ -1037,7 +1042,6 @@ static void ftp_cmd_cwd(ftp_client_t *client, const char *arg) {
         size_t cwd_len = strlen(client->cwd);
         size_t arg_len = strlen(arg);
         
-        // Check if concatenation would overflow
         if (cwd_len + arg_len + 2 > sizeof(new_path)) {
             ftp_send_response(client, "550 Path too long\r\n");
             return;
@@ -1055,9 +1059,9 @@ static void ftp_cmd_cwd(ftp_client_t *client, const char *arg) {
         strncpy(client->cwd, new_path, sizeof(client->cwd) - 1);
         client->cwd[sizeof(client->cwd) - 1] = '\0';
         ftp_send_response(client, FTP_RESP_250_FILE_OK);
-        printf("FTP: CWD changed to '%s'\n", client->cwd);
+        FTP_LOG("FTP: CWD changed to '%s'\n", client->cwd);
     } else {
-        printf("FTP: CWD failed for '%s', err=%d\n", new_path, res);
+        FTP_LOG("FTP: CWD failed for '%s', err=%d\n", new_path, res);
         ftp_send_response(client, FTP_RESP_550_FILE_ERROR);
     }
 }
@@ -1072,14 +1076,13 @@ static void ftp_cmd_cdup(ftp_client_t *client) {
     if (last_slash && last_slash != client->cwd) {
         *last_slash = '\0';  // Truncate at last slash
         ftp_send_response(client, FTP_RESP_250_FILE_OK);
-        printf("FTP: CDUP changed to '%s'\n", client->cwd);
+        FTP_LOG("FTP: CDUP changed to '%s'\n", client->cwd);
     } else {
         // Already at root
         strcpy(client->cwd, "/");
         ftp_send_response(client, FTP_RESP_250_FILE_OK);
     }
 }
-
 /**
  * Handle RETR command - download file
  */
@@ -1118,18 +1121,18 @@ static void ftp_cmd_retr(ftp_client_t *client, const char *arg) {
     FRESULT res = f_stat(filepath, &fno);
     
     if (res != FR_OK) {
-        printf("FTP: RETR - file not found: %s (err=%d)\n", filepath, res);
+        FTP_LOG("FTP: RETR - file not found: %s (err=%d)\n", filepath, res);
         ftp_send_response(client, "550 File not found\r\n");
         return;
     }
     
     if (fno.fattrib & AM_DIR) {
-        printf("FTP: RETR - is a directory: %s\n", filepath);
+        FTP_LOG("FTP: RETR - is a directory: %s\n", filepath);
         ftp_send_response(client, "550 Is a directory\r\n");
         return;
     }
     
-    printf("FTP: RETR requested: %s (%lu bytes)\n", filepath, (unsigned long)fno.fsize);
+    FTP_LOG("FTP: RETR requested: %s (%lu bytes)\n", filepath, (unsigned long)fno.fsize);
     
     // If already connected, start transfer immediately
     if (client->data_conn.connected) {
@@ -1142,7 +1145,7 @@ static void ftp_cmd_retr(ftp_client_t *client, const char *arg) {
     strncpy(client->retr_filename, filepath, sizeof(client->retr_filename) - 1);
     client->retr_filename[sizeof(client->retr_filename) - 1] = '\0';
     
-    printf("FTP: RETR pending, waiting for data connection\n");
+    FTP_LOG("FTP: RETR pending, waiting for data connection\n");
 }
 
 /**
@@ -1150,7 +1153,7 @@ static void ftp_cmd_retr(ftp_client_t *client, const char *arg) {
  * Returns list of supported extensions so clients know what's available
  */
 static void ftp_cmd_feat(ftp_client_t *client) {
-    printf("FTP: FEAT command received\n");
+    FTP_LOG("FTP: FEAT command received\n");
     
     // Send multi-line response (format: 211-Features: ... 211 End)
     ftp_send_response(client, FTP_RESP_211_FEAT_START);
@@ -1162,8 +1165,6 @@ static void ftp_cmd_feat(ftp_client_t *client) {
     ftp_send_response(client, " MLSD\r\n");           // Machine-readable listing
     ftp_send_response(client, " PASV\r\n");           // Passive mode
     ftp_send_response(client, " REST STREAM\r\n");    // Resume transfer
-    // TODO: Add when implemented:
-    // ftp_send_response(client, " MFMT\r\n");        // Modify file modification time
     
     // End features list
     ftp_send_response(client, FTP_RESP_211_FEAT_END);
@@ -1202,21 +1203,18 @@ static void ftp_cmd_mdtm(ftp_client_t *client, const char *arg) {
     FRESULT res = f_stat(filepath, &fno);
     
     if (res != FR_OK) {
-        printf("FTP: MDTM - file not found: %s (err=%d)\n", filepath, res);
+        FTP_LOG("FTP: MDTM - file not found: %s (err=%d)\n", filepath, res);
         ftp_send_response(client, "550 File not found\r\n");
         return;
     }
     
     if (fno.fattrib & AM_DIR) {
-        printf("FTP: MDTM - is a directory: %s\n", filepath);
+        FTP_LOG("FTP: MDTM - is a directory: %s\n", filepath);
         ftp_send_response(client, "550 Is a directory\r\n");
         return;
     }
     
     // Extract date/time from FAT timestamp
-    // fno.fdate bits: 15-9=year from 1980, 8-5=month, 4-0=day
-    // fno.ftime bits: 15-11=hour, 10-5=minute, 4-0=second/2
-    
     int year = 1980 + ((fno.fdate >> 9) & 0x7F);
     int month = (fno.fdate >> 5) & 0x0F;
     int day = fno.fdate & 0x1F;
@@ -1229,7 +1227,7 @@ static void ftp_cmd_mdtm(ftp_client_t *client, const char *arg) {
     snprintf(response, sizeof(response), "213 %04d%02d%02d%02d%02d%02d\r\n",
              year, month, day, hour, minute, second);
     
-    printf("FTP: MDTM %s -> %04d-%02d-%02d %02d:%02d:%02d\n", 
+    FTP_LOG("FTP: MDTM %s -> %04d-%02d-%02d %02d:%02d:%02d\n", 
            filepath, year, month, day, hour, minute, second);
     
     ftp_send_response(client, response);
@@ -1271,7 +1269,7 @@ static void ftp_cmd_size(ftp_client_t *client, const char *arg) {
     char response[64];
     snprintf(response, sizeof(response), "213 %lu\r\n", (unsigned long)fno.fsize);
     
-    printf("FTP: SIZE %s = %lu bytes\n", filepath, (unsigned long)fno.fsize);
+    FTP_LOG("FTP: SIZE %s = %lu bytes\n", filepath, (unsigned long)fno.fsize);
     
     ftp_send_response(client, response);
 }
@@ -1287,14 +1285,13 @@ static void ftp_process_command(ftp_client_t *client, char *cmd) {
         end--;
     }
     
-    printf("FTP: Received command: '%s'\n", cmd);
+    FTP_LOG("FTP: Received command: '%s'\n", cmd);
     
     // Parse command (first word)
     char *arg = strchr(cmd, ' ');
     if (arg) {
         *arg = '\0';
         arg++;
-        // Trim leading spaces
         while (*arg == ' ') arg++;
     }
     
@@ -1312,24 +1309,23 @@ static void ftp_process_command(ftp_client_t *client, char *cmd) {
             client->username[sizeof(client->username) - 1] = '\0';
             client->state = FTP_STATE_USER_OK;
             ftp_send_response(client, FTP_RESP_331_USER_OK);
-            printf("FTP: User '%s' requested login\n", client->username);
+            FTP_LOG("FTP: User '%s' requested login\n", client->username);
         } else {
             ftp_send_response(client, FTP_RESP_500_UNKNOWN);
         }
     }
     else if (strcmp(cmd, "PASS") == 0) {
         if (client->state == FTP_STATE_USER_OK) {
-            // Simple authentication check
             if (strcmp(client->username, FTP_USER) == 0 && 
                 arg && strcmp(arg, FTP_PASSWORD) == 0) {
                 client->state = FTP_STATE_LOGGED_IN;
-                strcpy(client->cwd, "/");  // Start at root
+                strcpy(client->cwd, "/");
                 ftp_send_response(client, FTP_RESP_230_LOGIN_OK);
-                printf("FTP: User '%s' logged in successfully\n", client->username);
+                FTP_LOG("FTP: User '%s' logged in successfully\n", client->username);
             } else {
                 client->state = FTP_STATE_IDLE;
                 ftp_send_response(client, FTP_RESP_530_LOGIN_FAILED);
-                printf("FTP: Login failed for user '%s'\n", client->username);
+                FTP_LOG("FTP: Login failed for user '%s'\n", client->username);
             }
         } else {
             ftp_send_response(client, FTP_RESP_500_UNKNOWN);
@@ -1342,8 +1338,7 @@ static void ftp_process_command(ftp_client_t *client, char *cmd) {
     // Commands below require authentication
     else if (strcmp(cmd, "QUIT") == 0) {
         ftp_send_response(client, FTP_RESP_221_GOODBYE);
-        printf("FTP: Client disconnecting\n");
-        vTaskDelay(pdMS_TO_TICKS(100));
+        FTP_LOG("FTP: Client disconnecting\n");
         ftp_close_client(client);
     }
     else if (strcmp(cmd, "SYST") == 0) {
@@ -1386,7 +1381,7 @@ static void ftp_process_command(ftp_client_t *client, char *cmd) {
         ftp_send_response(client, FTP_RESP_214_HELP);
     }
     else {
-        printf("FTP: Unknown/unimplemented command: %s\n", cmd);
+        FTP_LOG("FTP: Unknown/unimplemented command: %s\n", cmd);
         ftp_send_response(client, FTP_RESP_502_NOT_IMPL);
     }
 }
@@ -1404,43 +1399,57 @@ static err_t ftp_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
     }
     
     if (p == NULL) {
-        printf("FTP: Connection closed by client\n");
+        FTP_LOG("FTP: Connection closed by client\n");
         ftp_close_client(client);
         return ERR_OK;
     }
     
     if (p->tot_len > 0) {
+        FTP_LOG("FTP: Received %d bytes\n", p->tot_len);
+        
+        // Copy received data to command buffer (simple line-based protocol)
         uint16_t available = sizeof(client->cmd_buffer) - client->cmd_len - 1;
         uint16_t to_copy = (p->tot_len < available) ? p->tot_len : available;
         
         pbuf_copy_partial(p, client->cmd_buffer + client->cmd_len, to_copy, 0);
         client->cmd_len += to_copy;
-        client->cmd_buffer[client->cmd_len] = '\0';
+        client->cmd_buffer[client->cmd_len] = '\0';  // Null-terminate
         
-        cyw43_arch_lwip_begin();
-        tcp_recved(tpcb, p->tot_len);
-        cyw43_arch_lwip_end();
+        FTP_LOG("FTP: Command buffer length: %d bytes\n", client->cmd_len);
         
+        // Process complete lines (commands end with \r\n or \n)
         char *line_start = client->cmd_buffer;
         char *line_end;
         
         while ((line_end = strchr(line_start, '\n')) != NULL) {
-            *line_end = '\0';
+            *line_end = '\0';  // Replace '\n' with null terminator
             
+            // Process this command if not empty
             if (strlen(line_start) > 0) {
                 ftp_process_command(client, line_start);
             }
             
+            // Move to next line
             line_start = line_end + 1;
         }
         
+        // Keep any partial command at start of buffer
         if (line_start > client->cmd_buffer) {
             size_t remaining = strlen(line_start);
             memmove(client->cmd_buffer, line_start, remaining + 1);
             client->cmd_len = remaining;
         }
+        
+        FTP_LOG("FTP: Command buffer after processing: '%s' (len=%d)\n",
+               client->cmd_buffer, client->cmd_len);
+        
+        // Acknowledge received data
+        cyw43_arch_lwip_begin();
+        tcp_recved(tpcb, p->tot_len);
+        cyw43_arch_lwip_end();
     }
     
+    // Free the received buffer
     pbuf_free(p);
     return ERR_OK;
 }
@@ -1450,7 +1459,7 @@ static err_t ftp_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
  */
 static void ftp_error(void *arg, err_t err) {
     ftp_client_t *client = (ftp_client_t *)arg;
-    printf("FTP: TCP error %d\n", err);
+    FTP_LOG("FTP: TCP error %d\n", err);
     
     if (client) {
         client->pcb = NULL;
@@ -1466,11 +1475,12 @@ static void ftp_close_client(ftp_client_t *client) {
         return;
     }
     
-    printf("FTP: Closing client connection\n");
+    FTP_LOG("FTP: Closing client connection\n");
     
     // Close data connection first
     ftp_close_data_connection(client);
     
+    // Close control connection
     if (client->pcb) {
         cyw43_arch_lwip_begin();
         tcp_arg(client->pcb, NULL);
@@ -1481,6 +1491,7 @@ static void ftp_close_client(ftp_client_t *client) {
         client->pcb = NULL;
     }
     
+    // Reset client state
     client->state = FTP_STATE_IDLE;
     client->cmd_len = 0;
     client->cmd_buffer[0] = '\0';
@@ -1496,10 +1507,14 @@ static err_t ftp_accept(void *arg, struct tcp_pcb *newpcb, err_t err) {
     LWIP_UNUSED_ARG(arg);
     
     if (err != ERR_OK || newpcb == NULL) {
-        printf("FTP: Accept error\n");
+        FTP_LOG("FTP: Accept error, err=%d, newpcb=%p\n", err, newpcb);
         return ERR_VAL;
     }
     
+    FTP_LOG("FTP: New client connection from %s:%d\n",
+           ipaddr_ntoa(&newpcb->remote_ip), newpcb->remote_port);
+    
+    // Find an available client slot
     ftp_client_t *client = NULL;
     for (int i = 0; i < FTP_MAX_CLIENTS; i++) {
         if (!ftp_clients[i].active) {
@@ -1509,23 +1524,26 @@ static err_t ftp_accept(void *arg, struct tcp_pcb *newpcb, err_t err) {
     }
     
     if (!client) {
-        printf("FTP: Max clients reached\n");
+        FTP_LOG("FTP: Maximum number of clients reached, rejecting connection\n");
+        cyw43_arch_lwip_begin();
         tcp_close(newpcb);
+        cyw43_arch_lwip_end();
         return ERR_MEM;
     }
     
+    // Initialize client structure
     memset(client, 0, sizeof(ftp_client_t));
     client->pcb = newpcb;
     client->state = FTP_STATE_IDLE;
     client->active = true;
     strcpy(client->cwd, "/");
     
-    printf("FTP: Client connected from %s\n", ipaddr_ntoa(&newpcb->remote_ip));
-    
+    // Set callbacks
     tcp_arg(newpcb, client);
     tcp_recv(newpcb, ftp_recv);
     tcp_err(newpcb, ftp_error);
     
+    // Send welcome message
     ftp_send_response(client, FTP_RESP_220_WELCOME);
     
     return ERR_OK;
@@ -1538,29 +1556,31 @@ bool ftp_server_init(FATFS *fs) {
     printf("FTP: Initializing server on port %d\n", FTP_PORT);
     
     if (!fs) {
-        printf("FTP: FatFS filesystem required\n");
+        FTP_LOG("FTP: FatFS filesystem required\n");
         return false;
     }
     
     g_fs = fs;  // Store filesystem pointer
     memset(ftp_clients, 0, sizeof(ftp_clients));
     
+    // Create new TCP PCB for FTP server
     cyw43_arch_lwip_begin();
     ftp_server_pcb = tcp_new();
     cyw43_arch_lwip_end();
     
     if (!ftp_server_pcb) {
-        printf("FTP: Failed to create PCB\n");
+        FTP_LOG("FTP: Failed to create server PCB\n");
         return false;
     }
     
+    // Bind FTP server to port 21 on any IP
     err_t err;
     cyw43_arch_lwip_begin();
     err = tcp_bind(ftp_server_pcb, IP_ADDR_ANY, FTP_PORT);
     cyw43_arch_lwip_end();
     
     if (err != ERR_OK) {
-        printf("FTP: Bind failed, err=%d\n", err);
+        FTP_LOG("FTP: Failed to bind server PCB, err=%d\n", err);
         cyw43_arch_lwip_begin();
         tcp_close(ftp_server_pcb);
         cyw43_arch_lwip_end();
@@ -1568,47 +1588,49 @@ bool ftp_server_init(FATFS *fs) {
         return false;
     }
     
+    // Put into listening state
     cyw43_arch_lwip_begin();
     ftp_server_pcb = tcp_listen(ftp_server_pcb);
     cyw43_arch_lwip_end();
     
     if (!ftp_server_pcb) {
-        printf("FTP: Listen failed\n");
+        FTP_LOG("FTP: Failed to listen on server PCB\n");
         return false;
     }
     
+    // Set accept callback
     cyw43_arch_lwip_begin();
     tcp_accept(ftp_server_pcb, ftp_accept);
     cyw43_arch_lwip_end();
     
     printf("FTP: Server started successfully\n");
-    printf("FTP: Username: %s\n", FTP_USER);
-    printf("FTP: Password: %s\n", FTP_PASSWORD);
     
     return true;
 }
 
 /**
- * Process FTP server
+ * Process FTP server (placeholder)
  */
 void ftp_server_process(void) {
-    // Poll lwIP to process incoming connections and data
-    // The caller (FreeRTOS task) controls timing via vTaskDelay
-    cyw43_arch_poll();
+    // CRITICAL: This function is currently lightweight. The FTP server uses
+    // lwIP callbacks for control and data connections. This function is provided
+    // as a hook for future periodic tasks if needed.
 }
 
 /**
  * Shutdown FTP server
  */
 void ftp_server_shutdown(void) {
-    printf("FTP: Shutting down server\n");
+    FTP_LOG("FTP: Shutting down server\n");
     
+    // Close all client connections
     for (int i = 0; i < FTP_MAX_CLIENTS; i++) {
         if (ftp_clients[i].active) {
             ftp_close_client(&ftp_clients[i]);
         }
     }
     
+    // Close server PCB
     if (ftp_server_pcb) {
         cyw43_arch_lwip_begin();
         tcp_close(ftp_server_pcb);
@@ -1616,5 +1638,5 @@ void ftp_server_shutdown(void) {
         ftp_server_pcb = NULL;
     }
     
-    printf("FTP: Server stopped\n");
+    FTP_LOG("FTP: Server shutdown complete\n");
 }
