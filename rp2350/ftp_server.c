@@ -44,6 +44,10 @@ static ftp_client_t ftp_clients[FTP_MAX_CLIENTS];
 static uint16_t next_data_port = FTP_DATA_PORT_MIN;
 static FATFS *g_fs = NULL;  // FatFS filesystem
 
+/* FTP transfer tuning: streaming buffer and max TCP chunk size */
+#define FTP_STREAM_BUFFER_SIZE   (64 * 1024)   /* 64KB streaming buffer for large files */
+#define FTP_MAX_CHUNK_SIZE       8192          /* Max bytes per tcp_write call */
+
 // Forward declarations for internal static functions
 static int ftp_get_current_year(void);
 static err_t ftp_accept(void *arg, struct tcp_pcb *newpcb, err_t err);
@@ -523,7 +527,7 @@ static void ftp_send_list(ftp_client_t *client) {
  * Send next chunk of file data
  */
 /**
- * Send next chunk of file data from RAM buffer
+ * Send next chunk of file data from RAM buffer / streaming buffer
  */
 static void ftp_send_file_chunk(ftp_client_t *client) {
     if (!client->file_buffer || !client->data_conn.connected || !client->data_conn.pcb) {
@@ -591,11 +595,13 @@ static void ftp_send_file_chunk(ftp_client_t *client) {
             
             // Buffer is empty - read next chunk from SD card
             uint32_t remaining_file = client->file_buffer_size - client->file_buffer_pos;
-            uint32_t to_read = (remaining_file > 32768) ? 32768 : remaining_file;
+            uint32_t to_read = (remaining_file > FTP_STREAM_BUFFER_SIZE)
+                                   ? FTP_STREAM_BUFFER_SIZE
+                                   : remaining_file;
             
-            // Read minimum 16KB chunks for efficiency (except at end of file)
-            if (to_read > 16384 && to_read < 32768) {
-                to_read = 16384;
+            // Read minimum half-buffer chunks for efficiency (except at end of file)
+            if (to_read > (FTP_STREAM_BUFFER_SIZE / 2) && to_read < FTP_STREAM_BUFFER_SIZE) {
+                to_read = FTP_STREAM_BUFFER_SIZE / 2;
             }
             
             printf("FTP: Buffer empty, reading %lu bytes from SD (file pos %lu/%lu)\n",
@@ -640,19 +646,27 @@ static void ftp_send_file_chunk(ftp_client_t *client) {
             return;
         }
         
-        // Determine chunk size to send
-        uint16_t chunk_size = (buffer_available > tcp_available) ? tcp_available : buffer_available;
-        if (chunk_size > 4096) {
-            chunk_size = 4096;  // Smooth flow
+        // Determine chunk size to send:
+        // - At most half the current TCP send buffer
+        // - Capped at FTP_MAX_CHUNK_SIZE
+        uint16_t max_chunk = tcp_available / 2;
+        if (max_chunk > FTP_MAX_CHUNK_SIZE) {
+            max_chunk = FTP_MAX_CHUNK_SIZE;
         }
+        if (max_chunk == 0) {
+            client->sending_in_progress = false;
+            return;
+        }
+        
+        uint16_t chunk_size = (buffer_available > max_chunk) ? max_chunk : buffer_available;
         
         // Send chunk from buffer
         err_t err;
         cyw43_arch_lwip_begin();
         err = tcp_write(client->data_conn.pcb,
-                       client->file_buffer + client->buffer_send_pos,
-                       chunk_size,
-                       TCP_WRITE_FLAG_COPY);
+                        client->file_buffer + client->buffer_send_pos,
+                        chunk_size,
+                        TCP_WRITE_FLAG_COPY);
         cyw43_arch_lwip_end();
         
         if (err == ERR_OK) {
@@ -677,16 +691,22 @@ static void ftp_send_file_chunk(ftp_client_t *client) {
     
     // RAM buffer mode: send from existing buffer
     uint32_t remaining = client->file_buffer_size - client->file_buffer_pos;
-    uint16_t chunk_size = (remaining > available) ? available : remaining;
     
-    if (chunk_size == 0) {
+    // Use at most half the available TCP send buffer, capped at FTP_MAX_CHUNK_SIZE
+    uint16_t max_chunk = available / 2;
+    if (max_chunk > FTP_MAX_CHUNK_SIZE) {
+        max_chunk = FTP_MAX_CHUNK_SIZE;
+    }
+    if (max_chunk == 0) {
         client->sending_in_progress = false;
         return;
     }
     
-    // Limit chunk size to something reasonable (4KB max per call)
-    if (chunk_size > 4096) {
-        chunk_size = 4096;
+    uint16_t chunk_size = (remaining > max_chunk) ? max_chunk : remaining;
+    
+    if (chunk_size == 0) {
+        client->sending_in_progress = false;
+        return;
     }
     
     // Send chunk from RAM buffer
@@ -716,7 +736,7 @@ static void ftp_send_file_chunk(ftp_client_t *client) {
 
 /**
  * Start file transfer (called when data connection is established)
- * Loads entire file into RAM for efficient transfer
+ * Loads entire file into RAM for efficient transfer or streams with buffer
  */
 static void ftp_start_file_transfer(ftp_client_t *client, const char *filepath) {
     printf("FTP: Starting file transfer: %s\n", filepath);
@@ -744,8 +764,8 @@ static void ftp_start_file_transfer(ftp_client_t *client, const char *filepath) 
         // Large file - use streaming mode
         printf("FTP: Large file (%lu bytes), using streaming mode\n", file_size);
         
-        // Allocate 32KB read buffer for streaming
-        client->file_buffer = (uint8_t *)malloc(32768);  // 32KB
+        // Allocate streaming buffer
+        client->file_buffer = (uint8_t *)malloc(FTP_STREAM_BUFFER_SIZE);
         if (!client->file_buffer) {
             printf("FTP: Failed to allocate streaming buffer\n");
             f_close(&file);
@@ -779,11 +799,11 @@ static void ftp_start_file_transfer(ftp_client_t *client, const char *filepath) 
         
         // Read entire file into RAM
         UINT bytes_read;
-        FRESULT res = f_read(&file, client->file_buffer, file_size, &bytes_read);
+        FRESULT res2 = f_read(&file, client->file_buffer, file_size, &bytes_read);
         f_close(&file);  // Close file immediately after reading
         
-        if (res != FR_OK || bytes_read != file_size) {
-            printf("FTP: File read error %d, got %u bytes\n", res, bytes_read);
+        if (res2 != FR_OK || bytes_read != file_size) {
+            printf("FTP: File read error %d, got %u bytes\n", res2, bytes_read);
             free(client->file_buffer);
             client->file_buffer = NULL;
             ftp_send_response(client, "451 Read error\r\n");
@@ -812,7 +832,7 @@ static void ftp_start_file_transfer(ftp_client_t *client, const char *filepath) 
     printf("FTP: About to call ftp_send_file_chunk()\n");
     fflush(stdout);
     
-    // Start sending from RAM buffer
+    // Start sending
     ftp_send_file_chunk(client);
     
     // CRITICAL: Flush the initial chunk to start transmission
@@ -1569,14 +1589,12 @@ bool ftp_server_init(FATFS *fs) {
 }
 
 /**
- * Process FTP server (placeholder)
+ * Process FTP server
  */
 void ftp_server_process(void) {
-    // CRITICAL: Poll lwIP to process incoming connections and data
-    // This allows data connection callbacks to be processed
+    // Poll lwIP to process incoming connections and data
+    // The caller (FreeRTOS task) controls timing via vTaskDelay
     cyw43_arch_poll();
-    
-    vTaskDelay(pdMS_TO_TICKS(10));  // Reduced from 100ms for better responsiveness
 }
 
 /**
