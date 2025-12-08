@@ -31,6 +31,10 @@
 
 #define FTP_FILE_BUFFER_MAX     (256*1024)  // 256KB max RAM buffer per transfer
 
+/* FTP transfer tuning: streaming buffer and max TCP chunk size */
+#define FTP_STREAM_BUFFER_SIZE   (64 * 1024)   /* 64KB streaming buffer for large files */
+#define FTP_MAX_CHUNK_SIZE       8192          /* Max bytes per tcp_write call */
+
 // ============================================================================
 // FTP Response Code Strings
 // ============================================================================
