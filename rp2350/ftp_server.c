@@ -1347,8 +1347,12 @@ static void ftp_process_command(ftp_client_t *client, char *cmd) {
     else if (strcmp(cmd, "PWD") == 0 || strcmp(cmd, "XPWD") == 0) {
         ftp_send_response_fmt(client, FTP_RESP_257_PWD, client->cwd);
     }
-    else if (strcmp(cmd, "TYPE") == 0) {
-        ftp_send_response(client, FTP_RESP_200_TYPE_OK);
+    else if (strcasecmp(cmd, "TYPE") == 0) {
+        if (arg && (arg[0] == 'A' || arg[0] == 'a')) {
+            ftp_send_response(client, "504 ASCII mode not supported. Use TYPE I.\r\n");
+        } else {
+            ftp_send_response(client, "200 Type set to I.\r\n");
+        }
     }
     else if (strcmp(cmd, "PASV") == 0) {
         ftp_cmd_pasv(client);
