@@ -54,10 +54,6 @@ static ftp_client_t ftp_clients[FTP_MAX_CLIENTS];
 static uint16_t next_data_port = FTP_DATA_PORT_MIN;
 static FATFS *g_fs = NULL;  // FatFS filesystem
 
-/* FTP transfer tuning: streaming buffer and max TCP chunk size */
-#define FTP_STREAM_BUFFER_SIZE   (64 * 1024)   /* 64KB streaming buffer for large files */
-#define FTP_MAX_CHUNK_SIZE       8192          /* Max bytes per tcp_write call */
-
 // Forward declarations for internal static functions
 static int ftp_get_current_year(void);
 static err_t ftp_accept(void *arg, struct tcp_pcb *newpcb, err_t err);
