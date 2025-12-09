@@ -140,11 +140,37 @@ static void ftp_send_response_fmt(ftp_client_t *client, const char *fmt, ...) {
  * Get next available PASV port
  */
 static uint16_t ftp_get_next_data_port(void) {
-    uint16_t port = next_data_port++;
-    if (next_data_port > FTP_DATA_PORT_MAX) {
-        next_data_port = FTP_DATA_PORT_MIN;
+    uint16_t attempts = 0;
+    uint16_t port;
+    uint16_t max_attempts = FTP_DATA_PORT_MAX - FTP_DATA_PORT_MIN + 1;
+    
+    while (attempts < max_attempts) {
+        port = next_data_port++;
+        if (next_data_port > FTP_DATA_PORT_MAX) {
+            next_data_port = FTP_DATA_PORT_MIN;
+        }
+        
+        // Check if this port is already in use by another client
+        bool port_in_use = false;
+        for (int i = 0; i < FTP_MAX_CLIENTS; i++) {
+            if (ftp_clients[i].active && 
+                ftp_clients[i].data_conn.port == port &&
+                ftp_clients[i].data_conn.listen_pcb != NULL) {
+                port_in_use = true;
+                break;
+            }
+        }
+        
+        if (!port_in_use) {
+            return port;
+        }
+        
+        attempts++;
     }
-    return port;
+    
+    // All ports in use - return next port anyway and hope for the best
+    FTP_LOG("FTP: Warning - all data ports in use, may cause conflicts!\n");
+    return next_data_port++;
 }
 
 /**
@@ -202,6 +228,12 @@ static err_t ftp_data_sent(void *arg, struct tcp_pcb *tpcb, u16_t len) {
     
     LWIP_UNUSED_ARG(tpcb);
     // DON'T ignore len! It tells us if this is a real ACK or not
+    
+    // MULTI-CLIENT FIX: Validate client pointer
+    if (!client || !client->active) {
+        FTP_LOG("FTP Data: Invalid client in sent callback\n");
+        return ERR_ABRT;
+    }
     
     if (!client) {
         return ERR_OK;
@@ -276,12 +308,34 @@ static void ftp_data_error(void *arg, err_t err) {
 static err_t ftp_data_accept(void *arg, struct tcp_pcb *newpcb, err_t err) {
     ftp_client_t *client = (ftp_client_t *)arg;
     
-    if (err != ERR_OK || !newpcb || !client) {
-        FTP_LOG("FTP Data: Accept error (err=%d, newpcb=%p, client=%p)\n", err, newpcb, client);
+    // MULTI-CLIENT FIX: Validate client pointer
+    if (!client || !client->active) {
+        FTP_LOG("FTP Data: Invalid client in accept callback\n");
+        if (newpcb) {
+            cyw43_arch_lwip_begin();
+            tcp_abort(newpcb);
+            cyw43_arch_lwip_end();
+        }
+        return ERR_ABRT;
+    }
+    
+    // Verify this client is expecting a data connection
+    if (!client->data_conn.waiting_for_connection) {
+        FTP_LOG("FTP Data[%p]: Unexpected data connection\n", client);
+        if (newpcb) {
+            cyw43_arch_lwip_begin();
+            tcp_abort(newpcb);
+            cyw43_arch_lwip_end();
+        }
+        return ERR_ABRT;
+    }
+    
+    if (err != ERR_OK || !newpcb) {
+        FTP_LOG("FTP Data[%p]: Accept error (err=%d, newpcb=%p)\n", client, err, newpcb);
         return ERR_VAL;
     }
     
-    FTP_LOG("FTP Data: Client connected from %s\n", ipaddr_ntoa(&newpcb->remote_ip));
+    FTP_LOG("FTP Data[%p]: Client connected from %s\n", client, ipaddr_ntoa(&newpcb->remote_ip));
     
     // Set up data connection
     client->data_conn.pcb = newpcb;
