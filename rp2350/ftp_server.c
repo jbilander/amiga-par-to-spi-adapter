@@ -1,7 +1,7 @@
 /**
  * ftp_server.c - Enhanced FTP Server using raw lwIP API
  * 
- * VERSION: 2025-12-09-v16-dele (Added DELE file deletion)
+ * VERSION: 2025-12-09-v17-rename (Added DELE, RNFR/RNTO file operations)
  * 
  * Features:
  * - PASV (passive mode) support
@@ -10,6 +10,7 @@
  * - RETR (file download) with RAM buffering and streaming mode
  * - STOR (file upload) with RAM buffering and streaming mode
  * - DELE (file deletion)
+ * - RNFR/RNTO (file/directory rename)
  * - MFMT (set file modification time - timestamp preservation)
  * - MDTM (modification time query)
  * - SIZE (file size query)
@@ -1827,6 +1828,97 @@ static void ftp_cmd_dele(ftp_client_t *client, const char *arg) {
 }
 
 /**
+ * Handle RNFR command - rename from (step 1 of 2)
+ * Stores the source filename and waits for RNTO
+ */
+static void ftp_cmd_rnfr(ftp_client_t *client, const char *arg) {
+    if (!arg || strlen(arg) == 0) {
+        ftp_send_response(client, "501 Syntax error: filename required\r\n");
+        return;
+    }
+    
+    // Build full file path
+    char filepath[512];
+    if (arg[0] == '/') {
+        // Absolute path
+        strncpy(filepath, arg, sizeof(filepath) - 1);
+        filepath[sizeof(filepath) - 1] = '\0';
+    } else {
+        // Relative path
+        snprintf(filepath, sizeof(filepath), "%s/%s", client->cwd, arg);
+    }
+    
+    // Check if file/directory exists
+    FILINFO fno;
+    FRESULT res = f_stat(filepath, &fno);
+    
+    if (res != FR_OK) {
+        FTP_LOG("FTP: RNFR - file not found: %s (err=%d)\n", filepath, res);
+        ftp_send_response(client, "550 File not found\r\n");
+        client->pending_rename = false;
+        return;
+    }
+    
+    // Store source filename for RNTO command
+    strncpy(client->rename_from, filepath, FTP_FILENAME_MAX - 1);
+    client->rename_from[FTP_FILENAME_MAX - 1] = '\0';
+    client->pending_rename = true;
+    
+    FTP_LOG("FTP: RNFR - ready to rename: %s\n", filepath);
+    ftp_send_response(client, "350 File exists, ready for destination name\r\n");
+}
+
+/**
+ * Handle RNTO command - rename to (step 2 of 2)
+ * Performs the actual rename operation using stored source filename
+ */
+static void ftp_cmd_rnto(ftp_client_t *client, const char *arg) {
+    if (!arg || strlen(arg) == 0) {
+        ftp_send_response(client, "501 Syntax error: filename required\r\n");
+        client->pending_rename = false;
+        return;
+    }
+    
+    // Check if RNFR was issued first
+    if (!client->pending_rename) {
+        ftp_send_response(client, "503 Bad sequence of commands (use RNFR first)\r\n");
+        return;
+    }
+    
+    // Build destination path
+    char dest_path[512];
+    if (arg[0] == '/') {
+        // Absolute path
+        strncpy(dest_path, arg, sizeof(dest_path) - 1);
+        dest_path[sizeof(dest_path) - 1] = '\0';
+    } else {
+        // Relative path
+        snprintf(dest_path, sizeof(dest_path), "%s/%s", client->cwd, arg);
+    }
+    
+    // Perform the rename
+    FRESULT res = f_rename(client->rename_from, dest_path);
+    
+    // Clear pending rename flag
+    client->pending_rename = false;
+    
+    if (res != FR_OK) {
+        FTP_LOG("FTP: RNTO - rename failed: %s -> %s (err=%d)\n", 
+               client->rename_from, dest_path, res);
+        
+        if (res == FR_EXIST) {
+            ftp_send_response(client, "550 Destination already exists\r\n");
+        } else {
+            ftp_send_response(client, "550 Rename failed\r\n");
+        }
+        return;
+    }
+    
+    FTP_LOG("FTP: RNTO - renamed: %s -> %s\n", client->rename_from, dest_path);
+    ftp_send_response(client, FTP_RESP_250_FILE_OK);
+}
+
+/**
  * Process FTP command
  */
 static void ftp_process_command(ftp_client_t *client, char *cmd) {
@@ -1929,6 +2021,12 @@ static void ftp_process_command(ftp_client_t *client, char *cmd) {
     }
     else if (strcmp(cmd, "DELE") == 0) {
         ftp_cmd_dele(client, arg);
+    }
+    else if (strcmp(cmd, "RNFR") == 0) {
+        ftp_cmd_rnfr(client, arg);
+    }
+    else if (strcmp(cmd, "RNTO") == 0) {
+        ftp_cmd_rnto(client, arg);
     }
     else if (strcmp(cmd, "MDTM") == 0) {
         ftp_cmd_mdtm(client, arg);
@@ -2102,6 +2200,7 @@ static void ftp_close_client(ftp_client_t *client) {
     client->username[0] = '\0';
     client->cwd[0] = '\0';
     client->pending_stor = false;
+    client->pending_rename = false;
     client->active = false;
 }
 

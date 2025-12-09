@@ -160,8 +160,10 @@ typedef struct ftp_client {
     bool pending_mlsd;                      // MLSD command pending
     bool pending_retr;                      // RETR command pending
     bool pending_stor;                      // STOR command pending
+    bool pending_rename;                    // RNFR received, waiting for RNTO
     char retr_filename[FTP_FILENAME_MAX];   // Filename for pending RETR
     char stor_filename[FTP_FILENAME_MAX];   // Filename for pending STOR
+    char rename_from[FTP_FILENAME_MAX];     // Source filename for RNFR/RNTO
     
     // File transfer state (downloads)
     FIL retr_file;                          // FatFS file handle for RETR
