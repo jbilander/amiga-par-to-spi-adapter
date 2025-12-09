@@ -19,7 +19,7 @@
 
 #define FTP_PORT                21          // Standard FTP control port
 #define FTP_DATA_PORT_MIN       50000       // Passive mode port range start
-#define FTP_DATA_PORT_MAX       50010       // Passive mode port range end
+#define FTP_DATA_PORT_MAX       50099       // Passive mode port range end
 
 #define FTP_CMD_BUFFER_SIZE     256         // Maximum FTP command line length
 #define FTP_PATH_MAX_LEN        256         // Maximum path length
@@ -27,7 +27,8 @@
 #define FTP_USERNAME_MAX        32          // Maximum username length
 #define FTP_PASSWORD_MAX        32          // Maximum password length
 
-#define FTP_MAX_CLIENTS         2           // Maximum simultaneous clients
+#define FTP_MAX_CLIENTS         8           // Maximum simultaneous clients, 2 means 2 active sessions,
+                                            // BUT you need EXTRA slots for cleanup delays!
 
 #define FTP_FILE_BUFFER_MAX     (256*1024)  // 256KB max RAM buffer per transfer
 
