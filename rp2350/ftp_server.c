@@ -1,7 +1,7 @@
 /**
  * ftp_server.c - Enhanced FTP Server using raw lwIP API
  * 
- * VERSION: 2025-12-09-v15-stor-mfmt (Added STOR upload + MFMT timestamp preservation)
+ * VERSION: 2025-12-09-v16-dele (Added DELE file deletion)
  * 
  * Features:
  * - PASV (passive mode) support
@@ -9,6 +9,7 @@
  * - MLSD (machine-readable directory listing - RFC 3659)
  * - RETR (file download) with RAM buffering and streaming mode
  * - STOR (file upload) with RAM buffering and streaming mode
+ * - DELE (file deletion)
  * - MFMT (set file modification time - timestamp preservation)
  * - MDTM (modification time query)
  * - SIZE (file size query)
@@ -1776,6 +1777,56 @@ static void ftp_cmd_size(ftp_client_t *client, const char *arg) {
 }
 
 /**
+ * Handle DELE command - delete file
+ */
+static void ftp_cmd_dele(ftp_client_t *client, const char *arg) {
+    if (!arg || strlen(arg) == 0) {
+        ftp_send_response(client, "501 Syntax error: filename required\r\n");
+        return;
+    }
+    
+    // Build full file path
+    char filepath[512];
+    if (arg[0] == '/') {
+        // Absolute path
+        strncpy(filepath, arg, sizeof(filepath) - 1);
+        filepath[sizeof(filepath) - 1] = '\0';
+    } else {
+        // Relative path
+        snprintf(filepath, sizeof(filepath), "%s/%s", client->cwd, arg);
+    }
+    
+    // Check if file exists
+    FILINFO fno;
+    FRESULT res = f_stat(filepath, &fno);
+    
+    if (res != FR_OK) {
+        FTP_LOG("FTP: DELE - file not found: %s (err=%d)\n", filepath, res);
+        ftp_send_response(client, "550 File not found\r\n");
+        return;
+    }
+    
+    // Check if it's a directory (use RMD for directories)
+    if (fno.fattrib & AM_DIR) {
+        FTP_LOG("FTP: DELE - is a directory: %s\n", filepath);
+        ftp_send_response(client, "550 Is a directory (use RMD)\r\n");
+        return;
+    }
+    
+    // Delete the file
+    res = f_unlink(filepath);
+    
+    if (res != FR_OK) {
+        FTP_LOG("FTP: DELE - delete failed: %s (err=%d)\n", filepath, res);
+        ftp_send_response(client, "550 Delete failed\r\n");
+        return;
+    }
+    
+    FTP_LOG("FTP: DELE - deleted: %s\n", filepath);
+    ftp_send_response(client, FTP_RESP_250_FILE_OK);
+}
+
+/**
  * Process FTP command
  */
 static void ftp_process_command(ftp_client_t *client, char *cmd) {
@@ -1875,6 +1926,9 @@ static void ftp_process_command(ftp_client_t *client, char *cmd) {
     }
     else if (strcmp(cmd, "STOR") == 0) {
         ftp_cmd_stor(client, arg);
+    }
+    else if (strcmp(cmd, "DELE") == 0) {
+        ftp_cmd_dele(client, arg);
     }
     else if (strcmp(cmd, "MDTM") == 0) {
         ftp_cmd_mdtm(client, arg);
