@@ -1,7 +1,7 @@
 /**
  * ftp_server.c - Enhanced FTP Server using raw lwIP API
  * 
- * VERSION: 2025-12-09-v15-stor (Added STOR upload with buffered writes)
+ * VERSION: 2025-12-09-v15-stor-mfmt (Added STOR upload + MFMT timestamp preservation)
  * 
  * Features:
  * - PASV (passive mode) support
@@ -9,6 +9,7 @@
  * - MLSD (machine-readable directory listing - RFC 3659)
  * - RETR (file download) with RAM buffering and streaming mode
  * - STOR (file upload) with RAM buffering and streaming mode
+ * - MFMT (set file modification time - timestamp preservation)
  * - MDTM (modification time query)
  * - SIZE (file size query)
  * - FEAT (feature negotiation - RFC 2389)
@@ -1575,6 +1576,7 @@ static void ftp_cmd_feat(ftp_client_t *client) {
     ftp_send_response(client, " MLST type*;size*;modify*;\r\n"); // MLST facts
     ftp_send_response(client, " MLSD\r\n");           // Machine-readable listing
     ftp_send_response(client, " PASV\r\n");           // Passive mode
+    ftp_send_response(client, " MFMT\r\n");           // Modify file time
     ftp_send_response(client, " REST STREAM\r\n");    // Resume transfer
     
     // End features list
@@ -1641,6 +1643,94 @@ static void ftp_cmd_mdtm(ftp_client_t *client, const char *arg) {
     FTP_LOG("FTP: MDTM %s -> %04d-%02d-%02d %02d:%02d:%02d\n", 
            filepath, year, month, day, hour, minute, second);
     
+    ftp_send_response(client, response);
+}
+
+/**
+ * Handle MFMT command - set file modification time
+ * Format: MFMT YYYYMMDDHHMMSS filename
+ * Example: MFMT 20231215143022 /test.txt
+ */
+static void ftp_cmd_mfmt(ftp_client_t *client, const char *arg) {
+    if (!arg || strlen(arg) == 0) {
+        ftp_send_response(client, "501 Syntax error\r\n");
+        return;
+    }
+    
+    // Parse timestamp and filename
+    // Format: YYYYMMDDHHMMSS filename
+    char timestamp[15];
+    const char *filename = NULL;
+    
+    // Extract timestamp (first 14 characters)
+    if (strlen(arg) < 15) {  // At least "YYYYMMDDHHMMSSspace"
+        ftp_send_response(client, "501 Invalid timestamp format\r\n");
+        return;
+    }
+    
+    strncpy(timestamp, arg, 14);
+    timestamp[14] = '\0';
+    
+    // Find filename (skip timestamp and space)
+    filename = arg + 14;
+    while (*filename == ' ') filename++;
+    
+    if (strlen(filename) == 0) {
+        ftp_send_response(client, "501 No filename specified\r\n");
+        return;
+    }
+    
+    // Build full path
+    char filepath[512];
+    if (filename[0] == '/') {
+        strncpy(filepath, filename, sizeof(filepath) - 1);
+        filepath[sizeof(filepath) - 1] = '\0';
+    } else {
+        snprintf(filepath, sizeof(filepath), "%s/%s", client->cwd, filename);
+    }
+    
+    // Parse timestamp: YYYYMMDDHHMMSS
+    FILINFO fno;
+    int year, month, day, hour, min, sec;
+    
+    if (sscanf(timestamp, "%4d%2d%2d%2d%2d%2d", 
+               &year, &month, &day, &hour, &min, &sec) != 6) {
+        ftp_send_response(client, "501 Invalid timestamp format\r\n");
+        return;
+    }
+    
+    // Validate ranges
+    if (year < 1980 || year > 2107 ||
+        month < 1 || month > 12 ||
+        day < 1 || day > 31 ||
+        hour < 0 || hour > 23 ||
+        min < 0 || min > 59 ||
+        sec < 0 || sec > 59) {
+        ftp_send_response(client, "501 Timestamp out of range\r\n");
+        return;
+    }
+    
+    // Convert to FAT timestamp format
+    // FAT date: bits 15-9=year (from 1980), 8-5=month, 4-0=day
+    // FAT time: bits 15-11=hour, 10-5=minute, 4-0=second/2
+    fno.fdate = ((year - 1980) << 9) | (month << 5) | day;
+    fno.ftime = (hour << 11) | (min << 5) | (sec / 2);
+    
+    // Set file timestamp
+    FRESULT res = f_utime(filepath, &fno);
+    
+    if (res != FR_OK) {
+        FTP_LOG("FTP: MFMT failed for %s: %d\n", filepath, res);
+        ftp_send_response(client, "550 Could not set file time\r\n");
+        return;
+    }
+    
+    FTP_LOG("FTP: MFMT set %s to %s\n", filepath, timestamp);
+    
+    // Send success response (RFC 3659 format)
+    char response[256];
+    snprintf(response, sizeof(response), 
+             "213 Modify=%s; %s\r\n", timestamp, filename);
     ftp_send_response(client, response);
 }
 
@@ -1788,6 +1878,9 @@ static void ftp_process_command(ftp_client_t *client, char *cmd) {
     }
     else if (strcmp(cmd, "MDTM") == 0) {
         ftp_cmd_mdtm(client, arg);
+    }
+    else if (strcmp(cmd, "MFMT") == 0) {
+        ftp_cmd_mfmt(client, arg);
     }
     else if (strcmp(cmd, "SIZE") == 0) {
         ftp_cmd_size(client, arg);
