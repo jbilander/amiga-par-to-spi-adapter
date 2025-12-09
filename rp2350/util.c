@@ -35,3 +35,34 @@ void utf8_to_latin1(const char *utf8_str, char *latin1_buf, size_t buf_len) {
     }
     latin1_buf[latin1_idx] = '\0';
 }
+
+/**
+ * Get current time for FatFS
+ * 
+ * FatFS requires this function to provide timestamps for file operations.
+ * Since the Pico doesn't have an RTC, we return a fixed timestamp.
+ * 
+ * Returns time packed into a 32-bit value:
+ * bit 31:25 - Year from 1980 (0-127)
+ * bit 24:21 - Month (1-12)
+ * bit 20:16 - Day (1-31)
+ * bit 15:11 - Hour (0-23)
+ * bit 10:5  - Minute (0-59)
+ * bit 4:0   - Second / 2 (0-29)
+ */
+uint32_t get_fattime(void) {
+    // Return a fixed timestamp: 2024-01-01 00:00:00
+    // Year: 2024 - 1980 = 44
+    // Month: 1 (January)
+    // Day: 1
+    // Hour: 0
+    // Minute: 0
+    // Second: 0
+    
+    return ((uint32_t)(44) << 25)   // Year 2024
+         | ((uint32_t)(1) << 21)    // January
+         | ((uint32_t)(1) << 16)    // 1st day
+         | ((uint32_t)(0) << 11)    // 0 hours
+         | ((uint32_t)(0) << 5)     // 0 minutes
+         | ((uint32_t)(0) >> 1);    // 0 seconds
+}
