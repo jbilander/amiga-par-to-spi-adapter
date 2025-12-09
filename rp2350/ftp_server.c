@@ -1,13 +1,14 @@
 /**
  * ftp_server.c - Enhanced FTP Server using raw lwIP API
  * 
- * VERSION: 2025-12-06-v14 (CRITICAL FIX: tcp_output after each send)
+ * VERSION: 2025-12-09-v15-stor (Added STOR upload with buffered writes)
  * 
  * Features:
  * - PASV (passive mode) support
  * - LIST/NLST (directory listing) commands
  * - MLSD (machine-readable directory listing - RFC 3659)
  * - RETR (file download) with RAM buffering and streaming mode
+ * - STOR (file upload) with RAM buffering and streaming mode
  * - MDTM (modification time query)
  * - SIZE (file size query)
  * - FEAT (feature negotiation - RFC 2389)
@@ -68,6 +69,13 @@ static void ftp_send_file_chunk(ftp_client_t *client);
 static err_t ftp_data_accept(void *arg, struct tcp_pcb *newpcb, err_t err);
 static err_t ftp_data_sent(void *arg, struct tcp_pcb *tpcb, u16_t len);
 static void ftp_data_error(void *arg, err_t err);
+
+// Forward declarations for STOR (upload) support
+static err_t ftp_data_recv(void *arg, struct tcp_pcb *tpcb, 
+                          struct pbuf *p, err_t err);
+static void ftp_cmd_stor(ftp_client_t *client, const char *arg);
+static void ftp_start_file_upload(ftp_client_t *client, const char *filename);
+static void ftp_complete_buffered_upload(ftp_client_t *client);
 
 // ============================================================================
 // Helper Functions
@@ -203,6 +211,13 @@ static void ftp_close_data_connection(ftp_client_t *client) {
         f_close(&client->retr_file);
         client->retr_file_open = false;
         FTP_LOG("FTP: Closed open file handle\n");
+    }
+    
+    // Close any open upload file
+    if (client->stor_file_open) {
+        f_close(&client->stor_file);
+        client->stor_file_open = false;
+        FTP_LOG("FTP[%p]: Closed open upload file handle\n", client);
     }
     
     // Free RAM buffer if allocated
@@ -374,6 +389,13 @@ static err_t ftp_data_accept(void *arg, struct tcp_pcb *newpcb, err_t err) {
         FTP_LOG("FTP Data: Pending RETR detected, starting file transfer\n");
         client->pending_retr = false;
         ftp_start_file_transfer(client, client->retr_filename);
+    }
+    
+    // Handle pending STOR operation
+    if (client->pending_stor) {
+        FTP_LOG("FTP Data[%p]: Pending STOR detected, starting file upload\n", client);
+        client->pending_stor = false;
+        ftp_start_file_upload(client, client->stor_filename);
     }
     
     return ERR_OK;
@@ -1199,6 +1221,345 @@ static void ftp_cmd_retr(ftp_client_t *client, const char *arg) {
 }
 
 /**
+ * Handle STOR command - prepare to receive file upload
+ */
+static void ftp_cmd_stor(ftp_client_t *client, const char *arg) {
+    if (!arg || strlen(arg) == 0) {
+        ftp_send_response(client, "501 No filename specified\r\n");
+        return;
+    }
+    
+    // Build full file path
+    char filepath[512];
+    if (arg[0] == '/') {
+        // Absolute path
+        strncpy(filepath, arg, sizeof(filepath) - 1);
+        filepath[sizeof(filepath) - 1] = '\0';
+    } else {
+        // Relative path
+        size_t cwd_len = strlen(client->cwd);
+        size_t arg_len = strlen(arg);
+        
+        if (cwd_len + arg_len + 2 > sizeof(filepath)) {
+            ftp_send_response(client, "550 Path too long\r\n");
+            return;
+        }
+        
+        snprintf(filepath, sizeof(filepath), "%s/%s", client->cwd, arg);
+    }
+    
+    FTP_LOG("FTP[%p]: STOR requested: %s\n", client, filepath);
+    
+    // Check if we have a data connection ready
+    if (!client->data_conn.waiting_for_connection && !client->data_conn.connected) {
+        ftp_send_response(client, "425 Use PASV first\r\n");
+        return;
+    }
+    
+    // If data connection not yet established, mark STOR as pending
+    if (client->data_conn.waiting_for_connection) {
+        FTP_LOG("FTP[%p]: STOR pending, waiting for data connection\n", client);
+        client->pending_stor = true;
+        strncpy(client->stor_filename, filepath, sizeof(client->stor_filename) - 1);
+        client->stor_filename[sizeof(client->stor_filename) - 1] = '\0';
+        ftp_send_response(client, FTP_RESP_150_OPENING_DATA);
+        return;
+    }
+    
+    // Data connection ready, start upload immediately
+    ftp_send_response(client, FTP_RESP_150_OPENING_DATA);
+    ftp_start_file_upload(client, filepath);
+}
+
+/**
+ * Start receiving file upload
+ * Decides between RAM buffering (small files) or streaming (large files)
+ */
+static void ftp_start_file_upload(ftp_client_t *client, const char *filename) {
+    FTP_LOG("FTP[%p]: Starting file upload: %s\n", client, filename);
+    
+    // Initialize upload state
+    client->stor_bytes_received = 0;
+    client->stor_file_open = false;
+    client->stor_use_buffer = false;
+    client->file_buffer = NULL;
+    client->file_buffer_pos = 0;
+    client->buffer_data_len = 0;
+    
+    // Save filename for later (when writing to SD)
+    strncpy(client->stor_filename, filename, sizeof(client->stor_filename) - 1);
+    client->stor_filename[sizeof(client->stor_filename) - 1] = '\0';
+    
+    // Decide buffering strategy based on expected file size
+    // Note: We don't always know the size in advance, so we use streaming by default
+    // If we had SIZE command before STOR, we'd have stor_expected_size set
+    
+    uint32_t expected_size = client->stor_expected_size;
+    
+    if (expected_size > 0 && expected_size <= FTP_FILE_BUFFER_MAX) {
+        // Small file - use RAM buffering
+        FTP_LOG("FTP[%p]: Small file upload (%lu bytes), using RAM buffering\n", 
+               client, expected_size);
+        
+        client->file_buffer = (uint8_t *)malloc(expected_size);
+        if (!client->file_buffer) {
+            FTP_LOG("FTP[%p]: Failed to allocate %lu bytes for upload buffer\n", 
+                   client, expected_size);
+            ftp_send_response(client, "451 Memory allocation failed\r\n");
+            ftp_close_data_connection(client);
+            return;
+        }
+        
+        client->file_buffer_size = expected_size;
+        client->stor_use_buffer = true;
+        FTP_LOG("FTP[%p]: Allocated %lu byte buffer, ready to receive\n", 
+               client, expected_size);
+    } else {
+        // Large file or unknown size - use streaming with smaller buffer
+        FTP_LOG("FTP[%p]: Large/unknown size file upload, using streaming mode\n", client);
+        
+        // Open file for writing immediately
+        FRESULT res = f_open(&client->stor_file, filename, 
+                            FA_CREATE_ALWAYS | FA_WRITE);
+        
+        if (res != FR_OK) {
+            FTP_LOG("FTP[%p]: Failed to open file for writing: %d\n", client, res);
+            ftp_send_response(client, FTP_RESP_550_FILE_ERROR);
+            ftp_close_data_connection(client);
+            return;
+        }
+        
+        client->stor_file_open = true;
+        
+        // Allocate streaming buffer
+        client->file_buffer = (uint8_t *)malloc(FTP_STREAM_BUFFER_SIZE);
+        if (!client->file_buffer) {
+            FTP_LOG("FTP[%p]: Failed to allocate streaming buffer\n", client);
+            f_close(&client->stor_file);
+            client->stor_file_open = false;
+            ftp_send_response(client, "451 Memory allocation failed\r\n");
+            ftp_close_data_connection(client);
+            return;
+        }
+        
+        client->file_buffer_size = FTP_STREAM_BUFFER_SIZE;
+        client->stor_use_buffer = false;  // Streaming mode
+        FTP_LOG("FTP[%p]: File opened and buffer allocated, ready to receive\n", client);
+    }
+    
+    // Set up receive callback to handle incoming data
+    if (client->data_conn.pcb) {
+        cyw43_arch_lwip_begin();
+        tcp_recv(client->data_conn.pcb, ftp_data_recv);
+        cyw43_arch_lwip_end();
+    }
+}
+
+/**
+ * Complete a buffered upload - write entire RAM buffer to SD
+ */
+static void ftp_complete_buffered_upload(ftp_client_t *client) {
+    FTP_LOG("FTP[%p]: Completing buffered upload - %lu bytes to write\n", 
+           client, client->buffer_data_len);
+    
+    // Open file for writing
+    FRESULT res = f_open(&client->stor_file, client->stor_filename, 
+                        FA_CREATE_ALWAYS | FA_WRITE);
+    
+    if (res != FR_OK) {
+        FTP_LOG("FTP[%p]: Failed to open file for writing: %d\n", client, res);
+        ftp_send_response(client, FTP_RESP_550_FILE_ERROR);
+        return;
+    }
+    
+    // Write entire buffer to SD in one shot
+    UINT bytes_written;
+    res = f_write(&client->stor_file, client->file_buffer, 
+                 client->buffer_data_len, &bytes_written);
+    
+    f_close(&client->stor_file);
+    
+    if (res != FR_OK || bytes_written != client->buffer_data_len) {
+        FTP_LOG("FTP[%p]: Write error: %d (wrote %lu/%lu bytes)\n", 
+               client, res, bytes_written, client->buffer_data_len);
+        ftp_send_response(client, "426 Write error\r\n");
+        return;
+    }
+    
+    FTP_LOG("FTP[%p]: Upload complete - %lu bytes written to SD\n", 
+           client, bytes_written);
+    
+    // Send success response
+    char response[128];
+    snprintf(response, sizeof(response), 
+            "226 Transfer complete (%lu bytes received)\r\n",
+            client->stor_bytes_received);
+    ftp_send_response(client, response);
+}
+
+/**
+ * Data connection receive callback
+ * Called when file data arrives from client during STOR
+ */
+static err_t ftp_data_recv(void *arg, struct tcp_pcb *tpcb, 
+                          struct pbuf *p, err_t err) {
+    ftp_client_t *client = (ftp_client_t *)arg;
+    
+    LWIP_UNUSED_ARG(tpcb);
+    
+    // Validate client
+    if (!client || !client->active) {
+        FTP_LOG("FTP Data: Invalid client in recv callback\n");
+        if (p) pbuf_free(p);
+        return ERR_ABRT;
+    }
+    
+    // Connection closed by client (end of upload)
+    if (p == NULL) {
+        FTP_LOG("FTP[%p]: Client closed data connection, upload complete\n", client);
+        
+        // Handle completion based on buffering mode
+        if (client->stor_use_buffer) {
+            // RAM buffered mode - write entire buffer to SD now
+            ftp_complete_buffered_upload(client);
+        } else {
+            // Streaming mode - write any remaining data in buffer
+            if (client->buffer_data_len > 0 && client->stor_file_open) {
+                UINT bytes_written;
+                FRESULT res = f_write(&client->stor_file, client->file_buffer, 
+                                     client->buffer_data_len, &bytes_written);
+                
+                if (res != FR_OK || bytes_written != client->buffer_data_len) {
+                    FTP_LOG("FTP[%p]: Final write error: %d\n", client, res);
+                    ftp_send_response(client, "426 Write error\r\n");
+                } else {
+                    FTP_LOG("FTP[%p]: Upload complete - %lu bytes received\n", 
+                           client, client->stor_bytes_received);
+                    
+                    char response[128];
+                    snprintf(response, sizeof(response), 
+                            "226 Transfer complete (%lu bytes received)\r\n",
+                            client->stor_bytes_received);
+                    ftp_send_response(client, response);
+                }
+            }
+            
+            // Close file
+            if (client->stor_file_open) {
+                f_close(&client->stor_file);
+                client->stor_file_open = false;
+            }
+        }
+        
+        // Free buffer and close connection
+        if (client->file_buffer) {
+            free(client->file_buffer);
+            client->file_buffer = NULL;
+        }
+        
+        ftp_close_data_connection(client);
+        return ERR_OK;
+    }
+    
+    // Check for errors
+    if (err != ERR_OK) {
+        FTP_LOG("FTP[%p]: Receive error %d\n", client, err);
+        pbuf_free(p);
+        return err;
+    }
+    
+    // Check if buffer allocated
+    if (!client->file_buffer) {
+        FTP_LOG("FTP[%p]: Received data but no buffer allocated!\n", client);
+        pbuf_free(p);
+        return ERR_ABRT;
+    }
+    
+    uint16_t total_len = p->tot_len;
+    
+    // Process received data based on buffering mode
+    if (client->stor_use_buffer) {
+        // ═══════════════════════════════════════════════════════════════════
+        // RAM BUFFERING MODE - Store everything in RAM
+        // ═══════════════════════════════════════════════════════════════════
+        
+        // Check if data fits in buffer
+        if (client->buffer_data_len + total_len > client->file_buffer_size) {
+            FTP_LOG("FTP[%p]: Upload exceeds expected size, aborting\n", client);
+            pbuf_free(p);
+            ftp_send_response(client, "426 File too large\r\n");
+            ftp_close_data_connection(client);
+            return ERR_ABRT;
+        }
+        
+        // Copy data from pbuf chain into RAM buffer
+        uint16_t copied = 0;
+        struct pbuf *q;
+        for (q = p; q != NULL; q = q->next) {
+            memcpy(client->file_buffer + client->buffer_data_len + copied, 
+                   q->payload, q->len);
+            copied += q->len;
+        }
+        
+        client->buffer_data_len += copied;
+        client->stor_bytes_received += copied;
+        
+    } else {
+        // ═══════════════════════════════════════════════════════════════════
+        // STREAMING MODE - Write to SD when buffer fills
+        // ═══════════════════════════════════════════════════════════════════
+        
+        struct pbuf *q;
+        for (q = p; q != NULL; q = q->next) {
+            uint16_t data_left = q->len;
+            uint8_t *data_ptr = (uint8_t *)q->payload;
+            
+            while (data_left > 0) {
+                // Calculate how much we can copy to buffer
+                uint32_t space_in_buffer = client->file_buffer_size - client->buffer_data_len;
+                uint16_t to_copy = (data_left < space_in_buffer) ? data_left : space_in_buffer;
+                
+                // Copy to buffer
+                memcpy(client->file_buffer + client->buffer_data_len, 
+                      data_ptr, to_copy);
+                client->buffer_data_len += to_copy;
+                client->stor_bytes_received += to_copy;
+                data_ptr += to_copy;
+                data_left -= to_copy;
+                
+                // If buffer full, write to SD
+                if (client->buffer_data_len >= client->file_buffer_size) {
+                    UINT bytes_written;
+                    FRESULT res = f_write(&client->stor_file, client->file_buffer, 
+                                         client->buffer_data_len, &bytes_written);
+                    
+                    if (res != FR_OK || bytes_written != client->buffer_data_len) {
+                        FTP_LOG("FTP[%p]: Write error: %d\n", client, res);
+                        pbuf_free(p);
+                        ftp_send_response(client, "426 Write error\r\n");
+                        ftp_close_data_connection(client);
+                        return ERR_ABRT;
+                    }
+                    
+                    // Reset buffer for next chunk
+                    client->buffer_data_len = 0;
+                }
+            }
+        }
+    }
+    
+    // Tell lwIP we processed the data (flow control)
+    cyw43_arch_lwip_begin();
+    tcp_recved(tpcb, total_len);
+    cyw43_arch_lwip_end();
+    
+    // Free the pbuf
+    pbuf_free(p);
+    
+    return ERR_OK;
+}
+
+/**
  * Handle FEAT command - Feature negotiation (RFC 2389)
  * Returns list of supported extensions so clients know what's available
  */
@@ -1422,6 +1783,9 @@ static void ftp_process_command(ftp_client_t *client, char *cmd) {
     else if (strcmp(cmd, "RETR") == 0) {
         ftp_cmd_retr(client, arg);
     }
+    else if (strcmp(cmd, "STOR") == 0) {
+        ftp_cmd_stor(client, arg);
+    }
     else if (strcmp(cmd, "MDTM") == 0) {
         ftp_cmd_mdtm(client, arg);
     }
@@ -1513,12 +1877,51 @@ static err_t ftp_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
  */
 static void ftp_error(void *arg, err_t err) {
     ftp_client_t *client = (ftp_client_t *)arg;
-    FTP_LOG("FTP: TCP error %d\n", err);
     
-    if (client) {
-        client->pcb = NULL;
-        client->active = false;
+    if (!client) {
+        FTP_LOG("FTP: TCP error %d (no client)\n", err);
+        return;
     }
+    
+    int slot = (int)(client - ftp_clients);
+    LWIP_UNUSED_ARG(slot);  // Used only in FTP_LOG (debug builds)
+    FTP_LOG("FTP[%p]: TCP error %d on slot %d\n", client, err, slot);
+    
+    if (!client->active) {
+        FTP_LOG("FTP[%p]: Client already inactive, ignoring error\n", client);
+        return;
+    }
+    
+    // CRITICAL: Close data connection FIRST before marking inactive!
+    // Otherwise slot appears "free" but data connection still exists
+    ftp_close_data_connection(client);
+    
+    // Close any open file
+    if (client->retr_file_open) {
+        f_close(&client->retr_file);
+        client->retr_file_open = false;
+        FTP_LOG("FTP[%p]: Closed open file handle\n", client);
+    }
+    
+    // Close any open upload file
+    if (client->stor_file_open) {
+        f_close(&client->stor_file);
+        client->stor_file_open = false;
+        FTP_LOG("FTP[%p]: Closed open upload file handle\n", client);
+    }
+    
+    // Free file buffer
+    if (client->file_buffer) {
+        free(client->file_buffer);
+        client->file_buffer = NULL;
+        FTP_LOG("FTP[%p]: Freed file buffer\n", client);
+    }
+    
+    // Now mark slot as free
+    client->pcb = NULL;
+    client->active = false;
+    
+    FTP_LOG("FTP[%p]: Slot %d cleaned up and marked FREE\n", client, slot);
 }
 
 /**
@@ -1551,6 +1954,7 @@ static void ftp_close_client(ftp_client_t *client) {
     client->cmd_buffer[0] = '\0';
     client->username[0] = '\0';
     client->cwd[0] = '\0';
+    client->pending_stor = false;
     client->active = false;
 }
 

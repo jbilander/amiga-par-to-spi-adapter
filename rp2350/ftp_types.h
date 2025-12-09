@@ -159,19 +159,28 @@ typedef struct ftp_client {
     bool pending_list;                      // LIST command pending
     bool pending_mlsd;                      // MLSD command pending
     bool pending_retr;                      // RETR command pending
+    bool pending_stor;                      // STOR command pending
     char retr_filename[FTP_FILENAME_MAX];   // Filename for pending RETR
+    char stor_filename[FTP_FILENAME_MAX];   // Filename for pending STOR
     
-    // File transfer state
+    // File transfer state (downloads)
     FIL retr_file;                          // FatFS file handle for RETR
-    bool retr_file_open;                    // True if file is open
+    bool retr_file_open;                    // True if file is open for reading
     uint32_t retr_bytes_sent;               // Total bytes sent in transfer
     
-    // RAM buffering for efficient transfers
+    // File transfer state (uploads)
+    FIL stor_file;                          // FatFS file handle for STOR
+    bool stor_file_open;                    // True if file is open for writing
+    uint32_t stor_bytes_received;           // Total bytes received in transfer
+    bool stor_use_buffer;                   // True if using RAM buffering for small file
+    uint32_t stor_expected_size;            // Expected file size (0 if unknown)
+    
+    // RAM buffering for efficient transfers (used for both RETR and STOR)
     uint8_t *file_buffer;                   // RAM buffer for file data
-    uint32_t file_buffer_size;              // Total file size (or buffer size for small files)
-    uint32_t file_buffer_pos;               // Current file position (total bytes sent)
-    uint32_t buffer_data_len;               // Streaming: valid data currently in buffer
-    uint32_t buffer_send_pos;               // Streaming: current send position in buffer
+    uint32_t file_buffer_size;              // Size of allocated buffer
+    uint32_t file_buffer_pos;               // Current position in buffer
+    uint32_t buffer_data_len;               // Valid data currently in buffer
+    uint32_t buffer_send_pos;               // Streaming: current send position (RETR only)
     bool sending_in_progress;               // Re-entry guard for callbacks
 } ftp_client_t;
 
