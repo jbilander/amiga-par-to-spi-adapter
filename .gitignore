@@ -3,3 +3,4 @@
 esp32/build
 rp2040/build
 rp2350/build
+wifi_credentials.cmake

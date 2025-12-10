@@ -1,0 +1,40 @@
+; act_mirror.pio
+; 
+; Simple PIO program to mirror PIN_REQ to PIN_ACT
+; Makes ACT follow REQ with ~8-16ns latency (1-2 clock cycles)
+;
+; This runs continuously in hardware, independent of CPU/interrupts
+
+.program act_mirror
+init:
+	set pins, 1			; Set ACT high (not busy)
+.wrap_target
+    wait 0 pin 0        ; Wait for REQ to go low (active)
+    set pins, 0         ; Set ACT low (busy)
+    wait 1 pin 0        ; Wait for REQ to go high (inactive)
+    set pins, 1         ; Set ACT high (not busy)
+.wrap
+
+% c-sdk {
+static inline void act_mirror_program_init(PIO pio, uint sm, uint offset, 
+                                           uint req_pin, uint act_pin) {
+    pio_sm_config c = act_mirror_program_get_default_config(offset);
+    
+    // Configure REQ as input pin (for wait instruction)
+    sm_config_set_in_pins(&c, req_pin);
+    
+    // Configure ACT as SET pins output
+    sm_config_set_set_pins(&c, act_pin, 1);
+    
+    // Set ACT as output
+    pio_gpio_init(pio, act_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, act_pin, 1, true);
+    
+    // Run at full speed (125 MHz) - we want minimum latency
+    sm_config_set_clkdiv(&c, 1.0f);
+    
+    // Initialize and start the state machine
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
