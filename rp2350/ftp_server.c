@@ -1,7 +1,7 @@
 /**
  * ftp_server.c - Enhanced FTP Server using raw lwIP API
  * 
- * VERSION: 2025-12-09-v17-rename (Added DELE, RNFR/RNTO file operations)
+ * VERSION: 2025-12-09-v18-complete-fix (Fixed empty directory listing timeout)
  * 
  * Features:
  * - PASV (passive mode) support
@@ -11,6 +11,9 @@
  * - STOR (file upload) with RAM buffering and streaming mode
  * - DELE (file deletion)
  * - RNFR/RNTO (file/directory rename)
+ * - MKD/XMKD (make directory)
+ * - RMD/XRMD (remove directory)
+ * - NOOP (keepalive)
  * - MFMT (set file modification time - timestamp preservation)
  * - MDTM (modification time query)
  * - SIZE (file size query)
@@ -591,6 +594,15 @@ static void ftp_send_list(ftp_client_t *client) {
     
     FTP_LOG("FTP: LIST queued %d bytes for sending\n", total_sent);
     
+    // Handle empty directory case
+    if (total_sent == 0) {
+        // No data to send - close connection immediately and send success
+        FTP_LOG("FTP: LIST - empty directory, closing immediately\n");
+        ftp_close_data_connection(client);
+        ftp_send_response(client, FTP_RESP_226_TRANSFER_OK);
+        return;
+    }
+    
     // Flush all queued data
     cyw43_arch_lwip_begin();
     tcp_output(client->data_conn.pcb);
@@ -1051,6 +1063,15 @@ static void ftp_send_mlsd(ftp_client_t *client) {
     f_closedir(&dir);
     
     FTP_LOG("FTP: MLSD queued %d bytes for sending\n", total_sent);
+    
+    // Handle empty directory case
+    if (total_sent == 0) {
+        // No data to send - close connection immediately and send success
+        FTP_LOG("FTP: MLSD - empty directory, closing immediately\n");
+        ftp_close_data_connection(client);
+        ftp_send_response(client, FTP_RESP_226_TRANSFER_OK);
+        return;
+    }
     
     // Flush all queued data
     cyw43_arch_lwip_begin();
@@ -1919,6 +1940,115 @@ static void ftp_cmd_rnto(ftp_client_t *client, const char *arg) {
 }
 
 /**
+ * Handle MKD command - make directory
+ * Also handles XMKD (alternative command name)
+ */
+static void ftp_cmd_mkd(ftp_client_t *client, const char *arg) {
+    if (!arg || strlen(arg) == 0) {
+        ftp_send_response(client, "501 Syntax error: directory name required\r\n");
+        return;
+    }
+    
+    // Build full directory path
+    char dirpath[512];
+    if (arg[0] == '/') {
+        // Absolute path
+        strncpy(dirpath, arg, sizeof(dirpath) - 1);
+        dirpath[sizeof(dirpath) - 1] = '\0';
+    } else {
+        // Relative path
+        snprintf(dirpath, sizeof(dirpath), "%s/%s", client->cwd, arg);
+    }
+    
+    // Create the directory
+    FRESULT res = f_mkdir(dirpath);
+    
+    if (res != FR_OK) {
+        FTP_LOG("FTP: MKD - mkdir failed: %s (err=%d)\n", dirpath, res);
+        
+        if (res == FR_EXIST) {
+            ftp_send_response(client, "550 Directory already exists\r\n");
+        } else if (res == FR_NO_PATH) {
+            ftp_send_response(client, "550 Parent directory does not exist\r\n");
+        } else {
+            ftp_send_response(client, "550 Create directory failed\r\n");
+        }
+        return;
+    }
+    
+    FTP_LOG("FTP: MKD - created directory: %s\n", dirpath);
+    
+    // Response format: 257 "pathname" created
+    char response[600];  // Large enough for 512-byte path + formatting
+    snprintf(response, sizeof(response), "257 \"%s\" created\r\n", dirpath);
+    ftp_send_response(client, response);
+}
+
+/**
+ * Handle RMD command - remove directory
+ * Also handles XRMD (alternative command name)
+ */
+static void ftp_cmd_rmd(ftp_client_t *client, const char *arg) {
+    if (!arg || strlen(arg) == 0) {
+        ftp_send_response(client, "501 Syntax error: directory name required\r\n");
+        return;
+    }
+    
+    // Build full directory path
+    char dirpath[512];
+    if (arg[0] == '/') {
+        // Absolute path
+        strncpy(dirpath, arg, sizeof(dirpath) - 1);
+        dirpath[sizeof(dirpath) - 1] = '\0';
+    } else {
+        // Relative path
+        snprintf(dirpath, sizeof(dirpath), "%s/%s", client->cwd, arg);
+    }
+    
+    // Check if directory exists and is actually a directory
+    FILINFO fno;
+    FRESULT res = f_stat(dirpath, &fno);
+    
+    if (res != FR_OK) {
+        FTP_LOG("FTP: RMD - directory not found: %s (err=%d)\n", dirpath, res);
+        ftp_send_response(client, "550 Directory not found\r\n");
+        return;
+    }
+    
+    // Check if it's actually a directory
+    if (!(fno.fattrib & AM_DIR)) {
+        FTP_LOG("FTP: RMD - not a directory: %s\n", dirpath);
+        ftp_send_response(client, "550 Not a directory (use DELE for files)\r\n");
+        return;
+    }
+    
+    // Remove the directory (must be empty)
+    res = f_unlink(dirpath);
+    
+    if (res != FR_OK) {
+        FTP_LOG("FTP: RMD - remove failed: %s (err=%d)\n", dirpath, res);
+        
+        if (res == FR_DENIED) {
+            ftp_send_response(client, "550 Directory not empty\r\n");
+        } else {
+            ftp_send_response(client, "550 Remove directory failed\r\n");
+        }
+        return;
+    }
+    
+    FTP_LOG("FTP: RMD - removed directory: %s\n", dirpath);
+    ftp_send_response(client, FTP_RESP_250_FILE_OK);
+}
+
+/**
+ * Handle NOOP command - no operation (keepalive)
+ */
+static void ftp_cmd_noop(ftp_client_t *client) {
+    FTP_LOG("FTP: NOOP - keepalive\n");
+    ftp_send_response(client, "200 OK\r\n");
+}
+
+/**
  * Process FTP command
  */
 static void ftp_process_command(ftp_client_t *client, char *cmd) {
@@ -2027,6 +2157,15 @@ static void ftp_process_command(ftp_client_t *client, char *cmd) {
     }
     else if (strcmp(cmd, "RNTO") == 0) {
         ftp_cmd_rnto(client, arg);
+    }
+    else if (strcmp(cmd, "MKD") == 0 || strcmp(cmd, "XMKD") == 0) {
+        ftp_cmd_mkd(client, arg);
+    }
+    else if (strcmp(cmd, "RMD") == 0 || strcmp(cmd, "XRMD") == 0) {
+        ftp_cmd_rmd(client, arg);
+    }
+    else if (strcmp(cmd, "NOOP") == 0) {
+        ftp_cmd_noop(client);
     }
     else if (strcmp(cmd, "MDTM") == 0) {
         ftp_cmd_mdtm(client, arg);
