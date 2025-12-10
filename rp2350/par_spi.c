@@ -304,24 +304,27 @@ void par_spi_main(void) {
     
     bool card_present = !gpio_get(PIN_CDET);  // Active low
     if (card_present) {
-        printf("Amiga SPI Bridge: SD card detected, signaling Amiga...\n");
+        uint32_t boot_flag = *BOOT_FLAG_ADDR;
         
-        // CRITICAL: Initialize prev_cdet to "no card" to simulate insertion event
-        prev_cdet = (1 << PIN_CDET);  // Set bit = no card (active low)
-        
-        // Send SINGLE SHORT pulse matching real card detect interrupt
-        // (Not multiple long pulses - that confuses the Amiga driver)
-        gpio_put(PIN_IRQ, false);      // IRQ low (active)
-        gpio_set_dir(PIN_IRQ, true);   // Set to output
-        
-        busy_wait_us(10);              // Brief pulse (10μs)
-        
-        gpio_set_dir(PIN_IRQ, false);  // Release to input (pulled up externally)
+        if (boot_flag == BOOT_MODE_BARE_METAL) {
+            printf("Amiga SPI Bridge: SD card detected, signaling Amiga (mode switch)...\n");
+            
+            // Signal Amiga
+            gpio_put(PIN_IRQ, false);
+            gpio_set_dir(PIN_IRQ, true);
+            busy_wait_us(10);
+            gpio_set_dir(PIN_IRQ, false);
+            
+            // Clear the flag after using it
+            *BOOT_FLAG_ADDR = 0;
+            
+            printf("Amiga SPI Bridge: Card presence signal sent\n");
+        } else {
+            printf("Amiga SPI Bridge: SD card detected (normal power-on, no signal)\n");
+        }
         
         // Update prev_cdet to current state (card present)
         prev_cdet = gpio_get_all() & (1 << PIN_CDET);
-        
-        printf("Amiga SPI Bridge: Card presence signal sent\n");
     } else {
         printf("Amiga SPI Bridge: No SD card detected\n");
     }

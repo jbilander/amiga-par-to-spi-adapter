@@ -413,9 +413,6 @@ int main() {
         uint32_t boot_flag = *BOOT_FLAG_ADDR;
         printf("Watchdog reboot detected. Boot flag read: 0x%lX\n", boot_flag);
 
-        // Clear the flag immediately after reading it
-        *BOOT_FLAG_ADDR = 0;
-
         if (boot_flag == BOOT_MODE_FREERTOS) {
             launch_freertos_mode(); // Calls vTaskStartScheduler()
         } else {
