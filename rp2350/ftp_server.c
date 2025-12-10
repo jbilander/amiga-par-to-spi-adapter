@@ -52,8 +52,15 @@
 #endif
 
 // FTP Server Configuration
+// These can be overridden at compile time via CMake (in wifi_credentials.cmake)
+// Default credentials for easy out-of-the-box usage
+#ifndef FTP_USER
 #define FTP_USER        "pico"
+#endif
+
+#ifndef FTP_PASSWORD
 #define FTP_PASSWORD    "pico"
+#endif
 
 // Global FTP Server State
 static struct tcp_pcb *ftp_server_pcb = NULL;

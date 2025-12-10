@@ -69,6 +69,8 @@ include(${CMAKE_SOURCE_DIR}/wifi_credentials.cmake OPTIONAL)
 target_compile_definitions(${PROJECT} PRIVATE
     WIFI_SSID="${WIFI_SSID}"
     WIFI_PASSWORD="${WIFI_PASSWORD}"
+    FTP_USER="${FTP_USER}"
+    FTP_PASSWORD="${FTP_PASSWORD}"
 )
 
 target_include_directories(${PROJECT} PRIVATE
