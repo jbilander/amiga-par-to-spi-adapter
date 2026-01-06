@@ -34,7 +34,7 @@ add_library(freertos_config INTERFACE)
 target_include_directories(freertos_config SYSTEM INTERFACE include)
 target_compile_definitions(freertos_config INTERFACE projCOVERAGE_TEST=0)
 set(FREERTOS_KERNEL_PATH ${CMAKE_SOURCE_DIR}/build/_deps/freertos-src)
-include(FreeRTOS_Kernel_Import.cmake)
+include(FreeRTOS_Kernel_import.cmake)
 
 # === FATFS ===
 add_library(fatfs
