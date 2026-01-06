@@ -406,6 +406,13 @@ int main() {
     gpio_pull_up(PIN_MODE_SW);
     // ----------------------------------------------------------
 
+    // --- Initialize GPIO 28 for activity LED (used in both modes) ---
+    gpio_init(PIN_LED);
+    gpio_set_dir(PIN_LED, GPIO_OUT);
+    gpio_put(PIN_LED, 0);  // Start off
+    printf("Activity LED initialized (GPIO %d)\n", PIN_LED);
+    // -----------------------------------------------------------------
+
     sleep_ms(3000);
 
     // Check if we just rebooted from the watchdog and a flag is set

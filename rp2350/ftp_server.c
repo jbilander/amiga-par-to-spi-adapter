@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <hardware/gpio.h>
 #include <pico/cyw43_arch.h>
 #include <lwip/tcp.h>
 #include <lwip/ip_addr.h>
@@ -61,6 +62,16 @@
 #ifndef FTP_PASSWORD
 #define FTP_PASSWORD    "pico"
 #endif
+
+// SD Card Activity LED (GPIO 28)
+// Same pin used in bare-metal mode for SPI activity
+#ifndef PIN_LED
+#define PIN_LED 28
+#endif
+
+// Helper macros for SD card activity LED
+#define SD_LED_ON()  do { gpio_put(PIN_LED, 1); } while(0)
+#define SD_LED_OFF() do { gpio_put(PIN_LED, 0); } while(0)
 
 // Global FTP Server State
 static struct tcp_pcb *ftp_server_pcb = NULL;
@@ -516,10 +527,12 @@ static void ftp_send_list(ftp_client_t *client) {
     ftp_send_response(client, FTP_RESP_150_OPENING_DATA);
     
     // Open directory
+    SD_LED_ON();  // LED on during directory operations
     DIR dir;
     FRESULT res = f_opendir(&dir, client->cwd);
     
     if (res != FR_OK) {
+        SD_LED_OFF();
         FTP_LOG("FTP: Failed to open directory '%s', err=%d\n", client->cwd, res);
         ftp_send_response(client, FTP_RESP_550_FILE_ERROR);
         ftp_close_data_connection(client);
@@ -598,6 +611,7 @@ static void ftp_send_list(ftp_client_t *client) {
     }
     
     f_closedir(&dir);
+    SD_LED_OFF();  // LED off after directory operations
     
     FTP_LOG("FTP: LIST queued %d bytes for sending\n", total_sent);
     
@@ -719,8 +733,10 @@ static void ftp_send_file_chunk(ftp_client_t *client) {
             FTP_LOG("FTP: Reading %lu bytes from SD at file pos %lu\n",
                    to_read, client->file_buffer_pos);
             
+            SD_LED_ON();  // LED on during SD card read
             UINT bytes_read = 0;
             FRESULT res = f_read(&client->retr_file, client->file_buffer, to_read, &bytes_read);
+            SD_LED_OFF();  // LED off after SD card read
             
             if (res != FR_OK) {
                 FTP_LOG("FTP: File read error %d\n", res);
@@ -860,8 +876,10 @@ static void ftp_start_file_transfer(ftp_client_t *client, const char *filepath) 
     FTP_LOG("FTP: Starting file transfer: %s\n", filepath);
     
     // Open file for reading
+    SD_LED_ON();
     FIL file;
     FRESULT res = f_open(&file, filepath, FA_READ);
+    SD_LED_OFF();
     if (res != FR_OK) {
         FTP_LOG("FTP: Failed to open file '%s', err=%d\n", filepath, res);
         ftp_send_response(client, "550 Failed to open file\r\n");
@@ -916,8 +934,10 @@ static void ftp_start_file_transfer(ftp_client_t *client, const char *filepath) 
         }
         
         // Read entire file into RAM
+        SD_LED_ON();
         UINT bytes_read;
         FRESULT res2 = f_read(&file, client->file_buffer, file_size, &bytes_read);
+        SD_LED_OFF();
         f_close(&file);  // Close file immediately after reading
         
         if (res2 != FR_OK || bytes_read != file_size) {
@@ -1007,10 +1027,12 @@ static void ftp_send_mlsd(ftp_client_t *client) {
     ftp_send_response(client, FTP_RESP_150_OPENING_DATA);
     
     // Open directory
+    SD_LED_ON();  // LED on during directory operations
     DIR dir;
     FRESULT res = f_opendir(&dir, client->cwd);
     
     if (res != FR_OK) {
+        SD_LED_OFF();
         FTP_LOG("FTP: Failed to open directory '%s', err=%d\n", client->cwd, res);
         ftp_send_response(client, FTP_RESP_550_FILE_ERROR);
         ftp_close_data_connection(client);
@@ -1068,6 +1090,7 @@ static void ftp_send_mlsd(ftp_client_t *client) {
     }
     
     f_closedir(&dir);
+    SD_LED_OFF();  // LED off after directory operations
     
     FTP_LOG("FTP: MLSD queued %d bytes for sending\n", total_sent);
     
@@ -1220,8 +1243,10 @@ static void ftp_cmd_retr(ftp_client_t *client, const char *arg) {
     }
     
     // Check if file exists and is not a directory
+    SD_LED_ON();
     FILINFO fno;
     FRESULT res = f_stat(filepath, &fno);
+    SD_LED_OFF();
     
     if (res != FR_OK) {
         FTP_LOG("FTP: RETR - file not found: %s (err=%d)\n", filepath, res);
@@ -1350,8 +1375,10 @@ static void ftp_start_file_upload(ftp_client_t *client, const char *filename) {
         FTP_LOG("FTP[%p]: Large/unknown size file upload, using streaming mode\n", client);
         
         // Open file for writing immediately
+        SD_LED_ON();
         FRESULT res = f_open(&client->stor_file, filename, 
                             FA_CREATE_ALWAYS | FA_WRITE);
+        SD_LED_OFF();
         
         if (res != FR_OK) {
             FTP_LOG("FTP[%p]: Failed to open file for writing: %d\n", client, res);
@@ -1394,8 +1421,10 @@ static void ftp_complete_buffered_upload(ftp_client_t *client) {
            client, client->buffer_data_len);
     
     // Open file for writing
+    SD_LED_ON();
     FRESULT res = f_open(&client->stor_file, client->stor_filename, 
                         FA_CREATE_ALWAYS | FA_WRITE);
+    SD_LED_OFF();
     
     if (res != FR_OK) {
         FTP_LOG("FTP[%p]: Failed to open file for writing: %d\n", client, res);
@@ -1404,9 +1433,11 @@ static void ftp_complete_buffered_upload(ftp_client_t *client) {
     }
     
     // Write entire buffer to SD in one shot
+    SD_LED_ON();
     UINT bytes_written;
     res = f_write(&client->stor_file, client->file_buffer, 
                  client->buffer_data_len, &bytes_written);
+    SD_LED_OFF();
     
     f_close(&client->stor_file);
     
@@ -1456,9 +1487,11 @@ static err_t ftp_data_recv(void *arg, struct tcp_pcb *tpcb,
         } else {
             // Streaming mode - write any remaining data in buffer
             if (client->buffer_data_len > 0 && client->stor_file_open) {
+                SD_LED_ON();
                 UINT bytes_written;
                 FRESULT res = f_write(&client->stor_file, client->file_buffer, 
                                      client->buffer_data_len, &bytes_written);
+                SD_LED_OFF();
                 
                 if (res != FR_OK || bytes_written != client->buffer_data_len) {
                     FTP_LOG("FTP[%p]: Final write error: %d\n", client, res);
@@ -1560,9 +1593,11 @@ static err_t ftp_data_recv(void *arg, struct tcp_pcb *tpcb,
                 
                 // If buffer full, write to SD
                 if (client->buffer_data_len >= client->file_buffer_size) {
+                    SD_LED_ON();
                     UINT bytes_written;
                     FRESULT res = f_write(&client->stor_file, client->file_buffer, 
                                          client->buffer_data_len, &bytes_written);
+                    SD_LED_OFF();
                     
                     if (res != FR_OK || bytes_written != client->buffer_data_len) {
                         FTP_LOG("FTP[%p]: Write error: %d\n", client, res);
@@ -1642,8 +1677,10 @@ static void ftp_cmd_mdtm(ftp_client_t *client, const char *arg) {
     }
     
     // Get file info
+    SD_LED_ON();
     FILINFO fno;
     FRESULT res = f_stat(filepath, &fno);
+    SD_LED_OFF();
     
     if (res != FR_OK) {
         FTP_LOG("FTP: MDTM - file not found: %s (err=%d)\n", filepath, res);
@@ -1747,7 +1784,9 @@ static void ftp_cmd_mfmt(ftp_client_t *client, const char *arg) {
     fno.ftime = (hour << 11) | (min << 5) | (sec / 2);
     
     // Set file timestamp
+    SD_LED_ON();
     FRESULT res = f_utime(filepath, &fno);
+    SD_LED_OFF();
     
     if (res != FR_OK) {
         FTP_LOG("FTP: MFMT failed for %s: %d\n", filepath, res);
@@ -1783,8 +1822,10 @@ static void ftp_cmd_size(ftp_client_t *client, const char *arg) {
     filepath[sizeof(filepath) - 1] = '\0';
     
     // Get file info using f_stat
+    SD_LED_ON();
     FILINFO fno;
     FRESULT res = f_stat(filepath, &fno);
+    SD_LED_OFF();
     
     if (res != FR_OK) {
         ftp_send_response(client, "550 File not found\r\n");
@@ -1826,8 +1867,10 @@ static void ftp_cmd_dele(ftp_client_t *client, const char *arg) {
     }
     
     // Check if file exists
+    SD_LED_ON();
     FILINFO fno;
     FRESULT res = f_stat(filepath, &fno);
+    SD_LED_OFF();
     
     if (res != FR_OK) {
         FTP_LOG("FTP: DELE - file not found: %s (err=%d)\n", filepath, res);
@@ -1843,7 +1886,9 @@ static void ftp_cmd_dele(ftp_client_t *client, const char *arg) {
     }
     
     // Delete the file
+    SD_LED_ON();
     res = f_unlink(filepath);
+    SD_LED_OFF();
     
     if (res != FR_OK) {
         FTP_LOG("FTP: DELE - delete failed: %s (err=%d)\n", filepath, res);
@@ -1877,8 +1922,10 @@ static void ftp_cmd_rnfr(ftp_client_t *client, const char *arg) {
     }
     
     // Check if file/directory exists
+    SD_LED_ON();
     FILINFO fno;
     FRESULT res = f_stat(filepath, &fno);
+    SD_LED_OFF();
     
     if (res != FR_OK) {
         FTP_LOG("FTP: RNFR - file not found: %s (err=%d)\n", filepath, res);
@@ -1925,7 +1972,9 @@ static void ftp_cmd_rnto(ftp_client_t *client, const char *arg) {
     }
     
     // Perform the rename
+    SD_LED_ON();
     FRESULT res = f_rename(client->rename_from, dest_path);
+    SD_LED_OFF();
     
     // Clear pending rename flag
     client->pending_rename = false;
@@ -1968,7 +2017,9 @@ static void ftp_cmd_mkd(ftp_client_t *client, const char *arg) {
     }
     
     // Create the directory
+    SD_LED_ON();
     FRESULT res = f_mkdir(dirpath);
+    SD_LED_OFF();
     
     if (res != FR_OK) {
         FTP_LOG("FTP: MKD - mkdir failed: %s (err=%d)\n", dirpath, res);
@@ -2013,8 +2064,10 @@ static void ftp_cmd_rmd(ftp_client_t *client, const char *arg) {
     }
     
     // Check if directory exists and is actually a directory
+    SD_LED_ON();
     FILINFO fno;
     FRESULT res = f_stat(dirpath, &fno);
+    SD_LED_OFF();
     
     if (res != FR_OK) {
         FTP_LOG("FTP: RMD - directory not found: %s (err=%d)\n", dirpath, res);
@@ -2030,7 +2083,9 @@ static void ftp_cmd_rmd(ftp_client_t *client, const char *arg) {
     }
     
     // Remove the directory (must be empty)
+    SD_LED_ON();
     res = f_unlink(dirpath);
+    SD_LED_OFF();
     
     if (res != FR_OK) {
         FTP_LOG("FTP: RMD - remove failed: %s (err=%d)\n", dirpath, res);
