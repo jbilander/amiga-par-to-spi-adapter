@@ -266,6 +266,11 @@ void par_spi_main(void) {
 
     gpio_init(PIN_ACT);
     gpio_put(PIN_ACT, 1);
+
+    // Initialize SPI activity LED (GPIO 28)
+    gpio_init(PIN_LED);
+    gpio_set_dir(PIN_LED, GPIO_OUT);
+    gpio_put(PIN_LED, 0);  // Start off
     
     gpio_init(PIN_IRQ);
     gpio_set_dir(PIN_IRQ, GPIO_IN);  // Input by default, pulsed as output for signals
