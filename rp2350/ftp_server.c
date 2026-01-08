@@ -1496,20 +1496,21 @@ static err_t ftp_data_recv(void *arg, struct tcp_pcb *tpcb,
                 if (res != FR_OK || bytes_written != client->buffer_data_len) {
                     FTP_LOG("FTP[%p]: Final write error: %d\n", client, res);
                     ftp_send_response(client, "426 Write error\r\n");
-                } else {
-                    FTP_LOG("FTP[%p]: Upload complete - %lu bytes received\n", 
-                           client, client->stor_bytes_received);
-                    
-                    char response[128];
-                    snprintf(response, sizeof(response), 
-                            "226 Transfer complete (%lu bytes received)\r\n",
-                            client->stor_bytes_received);
-                    ftp_send_response(client, response);
                 }
             }
             
-            // Close file
+            // Always send completion response for streaming mode
             if (client->stor_file_open) {
+                FTP_LOG("FTP[%p]: Upload complete - %lu bytes received\n", 
+                       client, client->stor_bytes_received);
+                
+                char response[128];
+                snprintf(response, sizeof(response), 
+                        "226 Transfer complete (%lu bytes)\r\n", 
+                        client->stor_bytes_received);
+                ftp_send_response(client, response);
+                
+                // Close file
                 f_close(&client->stor_file);
                 client->stor_file_open = false;
             }
